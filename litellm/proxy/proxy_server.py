@@ -2978,6 +2978,27 @@ class ProxyConfig:
             ## INIT PROXY REDIS USAGE CLIENT ##
             redis_usage_cache = litellm.cache.cache
             spend_counter_cache.redis_cache = redis_usage_cache
+            # Share Redis with the LiteLLM_Config DualCache for cluster-wide hits.
+            if prisma_client is not None and hasattr(
+                prisma_client, "_config_param_cache"
+            ):
+                prisma_client._config_param_cache.redis_cache = redis_usage_cache
+                verbose_proxy_logger.info(
+                    "LiteLLM_Config DualCache: Redis layer attached; cluster-wide cache sharing enabled"
+                )
+        else:
+            # No Redis on litellm.cache → per-pod in-memory cache only; DB load
+            # scales linearly with pod count. Log so operators notice on large fleets.
+            if (
+                prisma_client is not None
+                and hasattr(prisma_client, "_config_param_cache")
+                and prisma_client._config_param_cache.redis_cache is None
+            ):
+                verbose_proxy_logger.info(
+                    "LiteLLM_Config DualCache: Redis layer NOT attached (no Redis "
+                    "configured on litellm.cache). Falling back to per-pod in-memory "
+                    "cache only; cluster-wide cache sharing is disabled."
+                )
             # Note: PKCE verifier storage uses redis_usage_cache directly (not
             # user_api_key_cache) to avoid routing all API-key lookups through Redis.
 
@@ -4980,6 +5001,17 @@ class ProxyConfig:
         global llm_router, llm_model_list, master_key, general_settings
 
         try:
+            # Warm the LiteLLM_Config cache for this tick in one find_many,
+            # so the get_generic_data calls below all hit cache.
+            await prisma_client.prefetch_config_params(
+                [
+                    "general_settings",
+                    "litellm_settings",
+                    "model_cost_map_reload_config",
+                    "anthropic_beta_headers_reload_config",
+                ]
+            )
+
             # Only load models from DB if "models" is in supported_db_objects (or if supported_db_objects is not set)
             if self._should_load_db_object(object_type="models"):
                 new_models = await self._get_models_from_db(prisma_client=prisma_client)
@@ -4989,8 +5021,10 @@ class ProxyConfig:
                     new_models=new_models, proxy_logging_obj=proxy_logging_obj
                 )
 
-            db_general_settings = await prisma_client.db.litellm_config.find_first(
-                where={"param_name": "general_settings"}
+            db_general_settings = await prisma_client.get_generic_data(
+                key="param_name",
+                value="general_settings",
+                table_name="config",
             )
 
             # update general settings
@@ -5083,9 +5117,10 @@ class ProxyConfig:
         from litellm.proxy.hooks.mcp_semantic_filter import SemanticToolFilterHook
 
         try:
-            # Load litellm_settings from DB
-            config_record = await prisma_client.db.litellm_config.find_unique(
-                where={"param_name": "litellm_settings"}
+            config_record = await prisma_client.get_generic_data(
+                key="param_name",
+                value="litellm_settings",
+                table_name="config",
             )
 
             if config_record is None or config_record.param_value is None:
@@ -5241,8 +5276,10 @@ class ProxyConfig:
         """
         try:
             # Get model cost map reload configuration from database
-            config_record = await prisma_client.db.litellm_config.find_unique(
-                where={"param_name": "model_cost_map_reload_config"}
+            config_record = await prisma_client.get_generic_data(
+                key="param_name",
+                value="model_cost_map_reload_config",
+                table_name="config",
             )
 
             if config_record is None or config_record.param_value is None:
@@ -5337,6 +5374,9 @@ class ProxyConfig:
                         },
                     },
                 )
+                await prisma_client.invalidate_config_param_cache(
+                    "model_cost_map_reload_config"
+                )
 
                 verbose_proxy_logger.info(
                     f"Model cost map reloaded successfully. Models count: {len(new_model_cost_map) if new_model_cost_map else 0}"
@@ -5356,8 +5396,10 @@ class ProxyConfig:
         """
         try:
             # Get anthropic beta headers reload configuration from database
-            config_record = await prisma_client.db.litellm_config.find_unique(
-                where={"param_name": "anthropic_beta_headers_reload_config"}
+            config_record = await prisma_client.get_generic_data(
+                key="param_name",
+                value="anthropic_beta_headers_reload_config",
+                table_name="config",
             )
 
             if config_record is None or config_record.param_value is None:
@@ -5444,6 +5486,9 @@ class ProxyConfig:
                             )
                         },
                     },
+                )
+                await prisma_client.invalidate_config_param_cache(
+                    "anthropic_beta_headers_reload_config"
                 )
 
                 # Count providers in config
@@ -12644,6 +12689,7 @@ async def update_config(  # noqa: PLR0915
                         "update": {"param_value": v},
                     },
                 )
+                await prisma_client.invalidate_config_param_cache(k)
 
         ### OLD LOGIC [TODO] MOVE TO DB ###
 
@@ -12831,6 +12877,7 @@ async def update_config_general_settings(
             "update": {"param_value": json.dumps(general_settings)},  # type: ignore
         },
     )
+    await prisma_client.invalidate_config_param_cache("general_settings")
 
     return response
 
@@ -13114,6 +13161,7 @@ async def delete_config_general_settings(
             "update": {"param_value": json.dumps(general_settings)},  # type: ignore
         },
     )
+    await prisma_client.invalidate_config_param_cache("general_settings")
 
     return response
 
@@ -13479,6 +13527,9 @@ async def reload_model_cost_map(
                 },
             },
         )
+        await prisma_client.invalidate_config_param_cache(
+            "model_cost_map_reload_config"
+        )
 
         models_count = len(new_model_cost_map) if new_model_cost_map else 0
         verbose_proxy_logger.info(
@@ -13548,6 +13599,9 @@ async def schedule_model_cost_map_reload(
                 },
             },
         )
+        await prisma_client.invalidate_config_param_cache(
+            "model_cost_map_reload_config"
+        )
 
         verbose_proxy_logger.info(
             f"Model cost map reload scheduled for every {hours} hours"
@@ -13600,6 +13654,9 @@ async def cancel_model_cost_map_reload(
         # Remove reload configuration from database
         await prisma_client.db.litellm_config.delete(
             where={"param_name": "model_cost_map_reload_config"}
+        )
+        await prisma_client.invalidate_config_param_cache(
+            "model_cost_map_reload_config"
         )
 
         verbose_proxy_logger.info("Model cost map reload schedule cancelled")
@@ -13831,6 +13888,9 @@ async def reload_anthropic_beta_headers(
                 },
             },
         )
+        await prisma_client.invalidate_config_param_cache(
+            "anthropic_beta_headers_reload_config"
+        )
 
         provider_count = sum(
             1 for k in new_config.keys() if k not in ["provider_aliases", "description"]
@@ -13904,6 +13964,9 @@ async def schedule_anthropic_beta_headers_reload(
                 },
             },
         )
+        await prisma_client.invalidate_config_param_cache(
+            "anthropic_beta_headers_reload_config"
+        )
 
         verbose_proxy_logger.info(
             f"Anthropic beta headers reload scheduled for every {hours} hours"
@@ -13956,6 +14019,9 @@ async def cancel_anthropic_beta_headers_reload(
         # Remove reload configuration from database
         await prisma_client.db.litellm_config.delete(
             where={"param_name": "anthropic_beta_headers_reload_config"}
+        )
+        await prisma_client.invalidate_config_param_cache(
+            "anthropic_beta_headers_reload_config"
         )
 
         verbose_proxy_logger.info("Anthropic beta headers reload schedule cancelled")

@@ -2333,6 +2333,7 @@ class TestPriceDataReloadAPI:
                     )
                     mock_prisma.db.litellm_config.upsert = AsyncMock(return_value=None)
 
+                    mock_prisma.invalidate_config_param_cache = AsyncMock(return_value=None)
                     response = client_with_auth.post("/reload/model_cost_map")
 
                     assert response.status_code == 200
@@ -2389,6 +2390,7 @@ class TestPriceDataReloadAPI:
                 mock_prisma.db.litellm_config.find_unique = AsyncMock(return_value=None)
                 mock_prisma.db.litellm_config.upsert = AsyncMock(return_value=None)
 
+                mock_prisma.invalidate_config_param_cache = AsyncMock(return_value=None)
                 response = client_with_auth.post("/reload/model_cost_map")
 
                 assert (
@@ -2403,6 +2405,7 @@ class TestPriceDataReloadAPI:
             # Mock database upsert
             mock_prisma.db.litellm_config.upsert = AsyncMock(return_value=None)
 
+            mock_prisma.invalidate_config_param_cache = AsyncMock(return_value=None)
             response = client_with_auth.post("/schedule/model_cost_map_reload?hours=6")
 
             assert response.status_code == 200
@@ -2440,6 +2443,7 @@ class TestPriceDataReloadAPI:
             # Mock database delete
             mock_prisma.db.litellm_config.delete = AsyncMock(return_value=None)
 
+            mock_prisma.invalidate_config_param_cache = AsyncMock(return_value=None)
             response = client_with_auth.delete("/schedule/model_cost_map_reload")
 
             assert response.status_code == 200
@@ -2587,6 +2591,7 @@ class TestPriceDataReloadIntegration:
                     )
                     mock_prisma.db.litellm_config.upsert = AsyncMock(return_value=None)
 
+                    mock_prisma.invalidate_config_param_cache = AsyncMock(return_value=None)
                     # Test reload endpoint
                     response = client_with_auth.post("/reload/model_cost_map")
                     assert response.status_code == 200
@@ -2609,6 +2614,10 @@ class TestPriceDataReloadIntegration:
 
         # Test case 1: No config in database
         mock_prisma.db.litellm_config.find_unique = AsyncMock(return_value=None)
+        # _check_and_reload_model_cost_map now routes through the cached
+        # get_generic_data helper; mock both so the test is resilient to
+        # further refactors.
+        mock_prisma.get_generic_data = AsyncMock(return_value=None)
 
         # Should return early without reloading
         asyncio.run(proxy_config._check_and_reload_model_cost_map(mock_prisma))
@@ -2617,6 +2626,7 @@ class TestPriceDataReloadIntegration:
         mock_config = MagicMock()
         mock_config.param_value = {"interval_hours": 6, "force_reload": False}
         mock_prisma.db.litellm_config.find_unique = AsyncMock(return_value=mock_config)
+        mock_prisma.get_generic_data = AsyncMock(return_value=mock_config)
 
         # Mock current time and last reload time
         with patch(
@@ -2634,8 +2644,10 @@ class TestPriceDataReloadIntegration:
         # Test case 3: Config with force reload
         mock_config.param_value = {"interval_hours": 6, "force_reload": True}
         mock_prisma.db.litellm_config.find_unique = AsyncMock(return_value=mock_config)
+        mock_prisma.get_generic_data = AsyncMock(return_value=mock_config)
         mock_prisma.db.litellm_config.upsert = AsyncMock(return_value=None)
 
+        mock_prisma.invalidate_config_param_cache = AsyncMock(return_value=None)
         original_model_cost = litellm.model_cost.copy()
         try:
             with patch(
@@ -2675,8 +2687,11 @@ class TestPriceDataReloadIntegration:
         mock_config = MagicMock()
         mock_config.param_value = {"interval_hours": 24, "force_reload": True}
         mock_prisma.db.litellm_config.find_unique = AsyncMock(return_value=mock_config)
+        # _check_and_reload_model_cost_map now reads through get_generic_data.
+        mock_prisma.get_generic_data = AsyncMock(return_value=mock_config)
         mock_prisma.db.litellm_config.upsert = AsyncMock(return_value=None)
 
+        mock_prisma.invalidate_config_param_cache = AsyncMock(return_value=None)
         original_model_cost = litellm.model_cost.copy()
         try:
             with patch(
@@ -2738,6 +2753,7 @@ class TestPriceDataReloadIntegration:
                     )
                     mock_prisma.db.litellm_config.upsert = AsyncMock(return_value=None)
 
+                    mock_prisma.invalidate_config_param_cache = AsyncMock(return_value=None)
                     response = client.post("/reload/model_cost_map")
                     assert response.status_code == 200
 
@@ -2770,8 +2786,11 @@ class TestPriceDataReloadIntegration:
         mock_config = MagicMock()
         mock_config.param_value = {"interval_hours": 12, "force_reload": True}
         mock_prisma.db.litellm_config.find_unique = AsyncMock(return_value=mock_config)
+        # _check_and_reload_anthropic_beta_headers now reads through get_generic_data.
+        mock_prisma.get_generic_data = AsyncMock(return_value=mock_config)
         mock_prisma.db.litellm_config.upsert = AsyncMock(return_value=None)
 
+        mock_prisma.invalidate_config_param_cache = AsyncMock(return_value=None)
         with patch(
             "litellm.anthropic_beta_headers_manager.reload_beta_headers_config"
         ) as mock_reload:
@@ -2825,6 +2844,7 @@ class TestPriceDataReloadIntegration:
                 )
                 mock_prisma.db.litellm_config.upsert = AsyncMock(return_value=None)
 
+                mock_prisma.invalidate_config_param_cache = AsyncMock(return_value=None)
                 response = client.post("/reload/anthropic_beta_headers")
                 assert response.status_code == 200
 
@@ -2875,6 +2895,7 @@ model_list:
         # Test the database upsert call that would be made by the schedule endpoint
         mock_prisma.db.litellm_config.upsert = AsyncMock(return_value=None)
 
+        mock_prisma.invalidate_config_param_cache = AsyncMock(return_value=None)
         # Simulate the database call that the schedule endpoint would make
         asyncio.run(
             mock_prisma.db.litellm_config.upsert(
@@ -2906,6 +2927,7 @@ model_list:
         # Test the database upsert call that would be made by the manual reload endpoint
         mock_prisma.db.litellm_config.upsert = AsyncMock(return_value=None)
 
+        mock_prisma.invalidate_config_param_cache = AsyncMock(return_value=None)
         # Simulate the database call that the manual reload endpoint would make
         asyncio.run(
             mock_prisma.db.litellm_config.upsert(
