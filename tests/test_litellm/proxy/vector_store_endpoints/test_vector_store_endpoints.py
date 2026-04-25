@@ -786,7 +786,24 @@ class TestVectorStoreManagementEndpointsExist:
         - POST /vector_store/info
         - POST /vector_store/update
         """
+        import importlib
+
+        from litellm.proxy._lazy_features import LAZY_FEATURES
         from litellm.proxy.proxy_server import app
+
+        # vector_store_management is lazy-loaded on first request to /vector_store/.
+        # Force-register here so the test can verify the routes exist. Skip the
+        # sys.modules guard because the module may have been imported as a
+        # direct function dependency without ever going through register_fn.
+        already_registered = any(
+            getattr(r, "path", None) == "/vector_store/new" for r in app.routes
+        )
+        if not already_registered:
+            for feat in LAZY_FEATURES:
+                if feat.name == "vector_store_management":
+                    module = importlib.import_module(feat.module_path)
+                    feat.register_fn(app, module)
+                    break
 
         # Define expected endpoints
         expected_endpoints = [
