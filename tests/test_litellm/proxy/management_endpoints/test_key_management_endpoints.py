@@ -9290,15 +9290,15 @@ def _make_team_key(token: str, team_id: str = "team-abc") -> LiteLLM_Verificatio
     )
 
 
-def _patch_team_keys_helpers(monkeypatch, *, hash_lookup):
-    """Common monkeypatching for the bulk_update_team_keys path."""
+def _patch_team_keys_helpers(monkeypatch):
+    """Common monkeypatching for bulk_update_team_keys; treats _hash_token_if_needed as identity (test tokens are already hashed-form)."""
     monkeypatch.setattr(
         "litellm.proxy.management_endpoints.key_management_endpoints.prepare_key_update_data",
         AsyncMock(return_value={"max_budget": 50.0}),
     )
     monkeypatch.setattr(
         "litellm.proxy.management_endpoints.key_management_endpoints._hash_token_if_needed",
-        lambda token: hash_lookup[token],
+        lambda token: token,
     )
     monkeypatch.setattr(
         "litellm.proxy.management_endpoints.key_management_endpoints._delete_cache_key_object",
@@ -9306,6 +9306,15 @@ def _patch_team_keys_helpers(monkeypatch, *, hash_lookup):
     )
     monkeypatch.setattr(
         "litellm.proxy.management_endpoints.key_management_endpoints.KeyManagementEventHooks.async_key_updated_hook",
+        AsyncMock(),
+    )
+    # team_obj path now runs because team_id is on every per-key UpdateKeyRequest.
+    monkeypatch.setattr(
+        "litellm.proxy.management_endpoints.key_management_endpoints.get_team_object",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "litellm.proxy.management_endpoints.key_management_endpoints._check_team_key_limits",
         AsyncMock(),
     )
 
@@ -9344,9 +9353,7 @@ async def test_bulk_update_team_keys_success_with_key_ids(monkeypatch):
     monkeypatch.setattr("litellm.proxy.proxy_server.proxy_logging_obj", MagicMock())
     monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", MagicMock())
     monkeypatch.setattr("litellm.proxy.proxy_server.user_custom_key_update", None)
-    _patch_team_keys_helpers(
-        monkeypatch, hash_lookup={"tok-a": "hashed-a", "tok-b": "hashed-b"}
-    )
+    _patch_team_keys_helpers(monkeypatch)
     monkeypatch.setattr(
         "litellm.proxy.management_endpoints.key_management_endpoints.TeamMemberPermissionChecks.can_team_member_execute_key_management_endpoint",
         AsyncMock(),
@@ -9414,9 +9421,7 @@ async def test_bulk_update_team_keys_success_all_keys_in_team(monkeypatch):
     monkeypatch.setattr("litellm.proxy.proxy_server.proxy_logging_obj", MagicMock())
     monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", MagicMock())
     monkeypatch.setattr("litellm.proxy.proxy_server.user_custom_key_update", None)
-    _patch_team_keys_helpers(
-        monkeypatch, hash_lookup={f"tok-{i}": f"hashed-{i}" for i in range(3)}
-    )
+    _patch_team_keys_helpers(monkeypatch)
     monkeypatch.setattr(
         "litellm.proxy.management_endpoints.key_management_endpoints.TeamMemberPermissionChecks.can_team_member_execute_key_management_endpoint",
         AsyncMock(),
@@ -9444,7 +9449,15 @@ async def test_bulk_update_team_keys_success_all_keys_in_team(monkeypatch):
         mock_prisma_client.db.litellm_verificationtoken.find_many.await_args.kwargs
     )
     assert where_kwargs["take"] == 501
-    assert where_kwargs["where"] == {"team_id": "team-abc"}
+    where_filter = where_kwargs["where"]
+    assert where_filter["team_id"] == "team-abc"
+    # blocked + expired keys must be excluded from the broadcast
+    assert where_filter["blocked"] is False
+    assert {"expires": None} in where_filter["OR"]
+    assert any(
+        isinstance(c.get("expires"), dict) and "gt" in c["expires"]
+        for c in where_filter["OR"]
+    )
 
 
 @pytest.mark.asyncio
@@ -9476,7 +9489,7 @@ async def test_bulk_update_team_keys_key_not_in_team(monkeypatch):
     monkeypatch.setattr("litellm.proxy.proxy_server.proxy_logging_obj", MagicMock())
     monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", MagicMock())
     monkeypatch.setattr("litellm.proxy.proxy_server.user_custom_key_update", None)
-    _patch_team_keys_helpers(monkeypatch, hash_lookup={"tok-a": "hashed-a"})
+    _patch_team_keys_helpers(monkeypatch)
     monkeypatch.setattr(
         "litellm.proxy.management_endpoints.key_management_endpoints.TeamMemberPermissionChecks.can_team_member_execute_key_management_endpoint",
         AsyncMock(),
@@ -9531,7 +9544,7 @@ async def test_bulk_update_team_keys_team_admin_authorized(monkeypatch):
     monkeypatch.setattr("litellm.proxy.proxy_server.proxy_logging_obj", MagicMock())
     monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", MagicMock())
     monkeypatch.setattr("litellm.proxy.proxy_server.user_custom_key_update", None)
-    _patch_team_keys_helpers(monkeypatch, hash_lookup={"tok-a": "hashed-a"})
+    _patch_team_keys_helpers(monkeypatch)
 
     auth_check = AsyncMock()
     monkeypatch.setattr(
@@ -9639,17 +9652,74 @@ async def test_bulk_update_team_keys_xor_validation():
 
 @pytest.mark.asyncio
 async def test_bulk_update_team_keys_forbidden_fields():
-    """update_fields.team_id / .key / .key_alias are rejected on construction."""
+    """Security-sensitive fields (RBAC, ownership, blocking, model access, scope) are rejected at request construction."""
+    from pydantic import ValidationError
+
     from litellm.types.proxy.management_endpoints.key_management_endpoints import (
         KeyUpdateFields,
     )
 
-    with pytest.raises(Exception):
-        KeyUpdateFields(team_id="other-team")
-    with pytest.raises(Exception):
-        KeyUpdateFields(key="sk-abc")
-    with pytest.raises(Exception):
-        KeyUpdateFields(key_alias="alias")
+    forbidden = {
+        # Per-key identifiers and scope guard
+        "key": "sk-abc",
+        "key_alias": "some-alias",
+        "team_id": "other-team",
+        # RBAC / route access — privilege escalation risk
+        "allowed_routes": ["management_routes"],
+        "allowed_passthrough_routes": ["/admin/*"],
+        "permissions": {"foo": True},
+        "object_permission": {"mcp_servers": []},
+        "access_group_ids": ["admins"],
+        # Ownership / cross-scope reassignment
+        "user_id": "another-user",
+        "organization_id": "another-org",
+        # Block control + privilege type
+        "blocked": True,
+        "key_type": "management",
+        # Model access + proxy config
+        "models": ["gpt-4"],
+        "config": {"some": "config"},
+        "router_settings": {"redis_host": "x"},
+        # Spend reset — admin-only, would let team admin zero out budget
+        # enforcement counters.
+        "spend": 0.0,
+    }
+    for field, value in forbidden.items():
+        with pytest.raises(ValidationError, match=field):
+            KeyUpdateFields(**{field: value})
+
+    # Sanity: budget/limit/tag fields ARE accepted.
+    ok = KeyUpdateFields(
+        max_budget=50.0,
+        budget_duration="30d",
+        tpm_limit=100,
+        rpm_limit=10,
+        tags=["prod"],
+    )
+    assert ok.max_budget == 50.0
+    assert ok.tags == ["prod"]
+
+
+@pytest.mark.asyncio
+async def test_bulk_update_team_keys_empty_update_fields_rejected():
+    """Empty update_fields is rejected at request construction (no N no-op DB writes)."""
+    from pydantic import ValidationError
+
+    from litellm.types.proxy.management_endpoints.key_management_endpoints import (
+        BulkUpdateTeamKeysRequest,
+        KeyUpdateFields,
+    )
+
+    with pytest.raises(ValidationError, match="at least one field"):
+        KeyUpdateFields()
+
+    # And the request as a whole is rejected when update_fields is empty.
+    with pytest.raises(ValidationError, match="at least one field"):
+        BulkUpdateTeamKeysRequest(
+            team_id="t",
+            all_keys_in_team=True,
+            update_fields={},
+        )
 
 
 @pytest.mark.asyncio
@@ -9736,3 +9806,302 @@ async def test_bulk_update_team_keys_no_keys_found(monkeypatch):
         )
 
     assert exc.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_bulk_update_team_keys_hashes_raw_sk_key_ids(monkeypatch):
+    """Regression: raw sk-... key_ids must be hashed before the find_many lookup (DB stores hashes)."""
+    from litellm.proxy._types import hash_token
+    from litellm.proxy.management_endpoints.key_management_endpoints import (
+        bulk_update_team_keys,
+    )
+    from litellm.types.proxy.management_endpoints.key_management_endpoints import (
+        BulkUpdateTeamKeysRequest,
+        KeyUpdateFields,
+    )
+
+    raw_sk = "sk-rawkey1234567890"
+    hashed = hash_token(raw_sk)
+    in_team_row = LiteLLM_VerificationToken(
+        token=hashed,
+        user_id="user-123",
+        models=[],
+        team_id="team-abc",
+        max_budget=None,
+    )
+
+    mock_prisma_client = AsyncMock()
+    mock_prisma_client.db.litellm_verificationtoken.find_many = AsyncMock(
+        return_value=[in_team_row]
+    )
+    mock_prisma_client.db.litellm_verificationtoken.find_unique = AsyncMock(
+        return_value=in_team_row
+    )
+    updated = MagicMock()
+    updated.model_dump.return_value = {"max_budget": 50.0}
+    mock_prisma_client.update_data = AsyncMock(return_value={"data": updated})
+
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", mock_prisma_client)
+    monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", MagicMock())
+    monkeypatch.setattr("litellm.proxy.proxy_server.proxy_logging_obj", MagicMock())
+    monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", MagicMock())
+    monkeypatch.setattr("litellm.proxy.proxy_server.user_custom_key_update", None)
+    monkeypatch.setattr(
+        "litellm.proxy.management_endpoints.key_management_endpoints.prepare_key_update_data",
+        AsyncMock(return_value={"max_budget": 50.0}),
+    )
+    monkeypatch.setattr(
+        "litellm.proxy.management_endpoints.key_management_endpoints._delete_cache_key_object",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "litellm.proxy.management_endpoints.key_management_endpoints.KeyManagementEventHooks.async_key_updated_hook",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "litellm.proxy.management_endpoints.key_management_endpoints.TeamMemberPermissionChecks.can_team_member_execute_key_management_endpoint",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "litellm.proxy.management_endpoints.key_management_endpoints.get_team_object",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "litellm.proxy.management_endpoints.key_management_endpoints._check_team_key_limits",
+        AsyncMock(),
+    )
+
+    request = BulkUpdateTeamKeysRequest(
+        team_id="team-abc",
+        key_ids=[raw_sk],
+        update_fields=KeyUpdateFields(max_budget=50.0),
+    )
+    response = await bulk_update_team_keys(
+        data=request,
+        user_api_key_dict=UserAPIKeyAuth(
+            user_role=LitellmUserRoles.PROXY_ADMIN,
+            api_key="sk-admin",
+            user_id="admin",
+        ),
+        litellm_changed_by=None,
+    )
+
+    # find_many must be called with the *hashed* token id, not the raw sk-
+    where_arg = (
+        mock_prisma_client.db.litellm_verificationtoken.find_many.await_args.kwargs[
+            "where"
+        ]
+    )
+    assert where_arg["token"] == {
+        "in": [hashed]
+    }, f"expected hashed token in DB lookup, got {where_arg['token']}"
+
+    # And the response should report the user-supplied raw sk- form, not the hash
+    assert len(response.successful_updates) == 1
+    assert len(response.failed_updates) == 0
+    assert response.successful_updates[0].key == raw_sk
+
+
+@pytest.mark.asyncio
+async def test_bulk_update_team_keys_auth_check_runs_when_no_keys_match(monkeypatch):
+    """Regression: non-admin with bogus key_ids must still hit the team-membership gate, not silently fall through to a 200."""
+    from litellm.proxy.management_endpoints.key_management_endpoints import (
+        bulk_update_team_keys,
+    )
+    from litellm.types.proxy.management_endpoints.key_management_endpoints import (
+        BulkUpdateTeamKeysRequest,
+        KeyUpdateFields,
+    )
+
+    mock_prisma_client = AsyncMock()
+    # Caller passes key_ids but none of them belong to data.team_id.
+    mock_prisma_client.db.litellm_verificationtoken.find_many = AsyncMock(
+        return_value=[]
+    )
+
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", mock_prisma_client)
+    monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", MagicMock())
+    monkeypatch.setattr("litellm.proxy.proxy_server.proxy_logging_obj", MagicMock())
+    monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", MagicMock())
+    monkeypatch.setattr("litellm.proxy.proxy_server.user_custom_key_update", None)
+
+    auth_check = AsyncMock(
+        side_effect=ProxyException(
+            message="not in team",
+            type="team_member_permission_error",
+            param="/key/update",
+            code=401,
+        )
+    )
+    monkeypatch.setattr(
+        "litellm.proxy.management_endpoints.key_management_endpoints.TeamMemberPermissionChecks.can_team_member_execute_key_management_endpoint",
+        auth_check,
+    )
+
+    request = BulkUpdateTeamKeysRequest(
+        team_id="team-i-do-not-belong-to",
+        key_ids=["bogus-key-1", "bogus-key-2"],
+        update_fields=KeyUpdateFields(max_budget=1.0),
+    )
+
+    with pytest.raises(ProxyException):
+        await bulk_update_team_keys(
+            data=request,
+            user_api_key_dict=UserAPIKeyAuth(
+                user_role=LitellmUserRoles.INTERNAL_USER,
+                api_key="sk-outsider",
+                user_id="outsider",
+            ),
+            litellm_changed_by=None,
+        )
+
+    # Auth check must have been invoked exactly once before the loop.
+    assert auth_check.await_count == 1
+    # And it must have been anchored on data.team_id (sentinel row), proving
+    # we don't depend on existing_keys to derive the team for the gate.
+    anchor = auth_check.await_args.kwargs["existing_key_row"]
+    assert anchor.team_id == "team-i-do-not-belong-to"
+    # No DB writes should have happened.
+    mock_prisma_client.update_data.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_bulk_update_team_keys_does_not_log_raw_sk_token_on_failure(
+    monkeypatch, caplog
+):
+    """Regression: per-key failure must not log the raw sk-... (ERROR-level logs persist)."""
+    import logging
+
+    from litellm.proxy._types import hash_token
+    from litellm.proxy.management_endpoints.key_management_endpoints import (
+        bulk_update_team_keys,
+    )
+    from litellm.types.proxy.management_endpoints.key_management_endpoints import (
+        BulkUpdateTeamKeysRequest,
+        KeyUpdateFields,
+    )
+
+    raw_sk = "sk-supersecret1234567890"
+    hashed = hash_token(raw_sk)
+    in_team_row = LiteLLM_VerificationToken(
+        token=hashed,
+        user_id="user-123",
+        models=[],
+        team_id="team-abc",
+        max_budget=None,
+    )
+
+    mock_prisma_client = AsyncMock()
+    mock_prisma_client.db.litellm_verificationtoken.find_many = AsyncMock(
+        return_value=[in_team_row]
+    )
+    # Force the per-key path to raise so we exercise the exception logger.
+    mock_prisma_client.db.litellm_verificationtoken.find_unique = AsyncMock(
+        side_effect=RuntimeError("boom")
+    )
+
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", mock_prisma_client)
+    monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", MagicMock())
+    monkeypatch.setattr("litellm.proxy.proxy_server.proxy_logging_obj", MagicMock())
+    monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", MagicMock())
+    monkeypatch.setattr("litellm.proxy.proxy_server.user_custom_key_update", None)
+    monkeypatch.setattr(
+        "litellm.proxy.management_endpoints.key_management_endpoints.TeamMemberPermissionChecks.can_team_member_execute_key_management_endpoint",
+        AsyncMock(),
+    )
+
+    request = BulkUpdateTeamKeysRequest(
+        team_id="team-abc",
+        key_ids=[raw_sk],
+        update_fields=KeyUpdateFields(max_budget=50.0),
+    )
+
+    with caplog.at_level(logging.ERROR, logger="LiteLLM Proxy"):
+        response = await bulk_update_team_keys(
+            data=request,
+            user_api_key_dict=UserAPIKeyAuth(
+                user_role=LitellmUserRoles.PROXY_ADMIN,
+                api_key="sk-admin",
+                user_id="admin",
+            ),
+            litellm_changed_by=None,
+        )
+
+    # The update must have failed (we forced the per-key fetch to raise).
+    assert len(response.failed_updates) == 1
+
+    # No log record — at any level — may contain the raw secret.
+    all_log_text = "\n".join(record.getMessage() for record in caplog.records)
+    assert (
+        raw_sk not in all_log_text
+    ), f"raw sk- token leaked into logs:\n{all_log_text}"
+
+
+@pytest.mark.asyncio
+async def test_bulk_update_team_keys_propagates_team_id_to_per_key_request(
+    monkeypatch,
+):
+    """Regression: per-key UpdateKeyRequest must carry data.team_id so _check_team_key_limits runs (gates guaranteed_throughput allocation)."""
+    from litellm.proxy.management_endpoints.key_management_endpoints import (
+        bulk_update_team_keys,
+    )
+    from litellm.types.proxy.management_endpoints.key_management_endpoints import (
+        BulkUpdateTeamKeysRequest,
+        KeyUpdateFields,
+    )
+
+    key_a = _make_team_key("tok-a", team_id="team-abc")
+
+    mock_prisma_client = AsyncMock()
+    mock_prisma_client.db.litellm_verificationtoken.find_many = AsyncMock(
+        return_value=[key_a]
+    )
+
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", mock_prisma_client)
+    monkeypatch.setattr("litellm.proxy.proxy_server.user_api_key_cache", MagicMock())
+    monkeypatch.setattr("litellm.proxy.proxy_server.proxy_logging_obj", MagicMock())
+    monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", MagicMock())
+    monkeypatch.setattr("litellm.proxy.proxy_server.user_custom_key_update", None)
+    monkeypatch.setattr(
+        "litellm.proxy.management_endpoints.key_management_endpoints.TeamMemberPermissionChecks.can_team_member_execute_key_management_endpoint",
+        AsyncMock(),
+    )
+
+    captured_requests = []
+
+    async def fake_process(*, update_key_request, **kwargs):
+        captured_requests.append(update_key_request)
+        return {"max_budget": update_key_request.max_budget}
+
+    monkeypatch.setattr(
+        "litellm.proxy.management_endpoints.key_management_endpoints._process_single_key_update",
+        fake_process,
+    )
+
+    request = BulkUpdateTeamKeysRequest(
+        team_id="team-abc",
+        key_ids=["tok-a"],
+        update_fields=KeyUpdateFields(
+            tpm_limit=10_000,
+            tpm_limit_type="guaranteed_throughput",
+        ),
+    )
+    response = await bulk_update_team_keys(
+        data=request,
+        user_api_key_dict=UserAPIKeyAuth(
+            user_role=LitellmUserRoles.PROXY_ADMIN,
+            api_key="sk-admin",
+            user_id="admin",
+        ),
+        litellm_changed_by=None,
+    )
+
+    assert len(response.successful_updates) == 1
+    assert len(captured_requests) == 1
+    sent = captured_requests[0]
+    # The scope guard: the per-key request must carry the request's team_id,
+    # not None. This is what gates _check_team_key_limits inside the helper.
+    assert sent.team_id == "team-abc"
+    # Sanity: the user-supplied limit fields are still propagated.
+    assert sent.tpm_limit == 10_000
+    assert sent.tpm_limit_type == "guaranteed_throughput"
