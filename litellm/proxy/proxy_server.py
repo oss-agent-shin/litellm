@@ -7597,6 +7597,7 @@ class ProxyStartupEvent:
     "/models", dependencies=[Depends(user_api_key_auth)], tags=["model management"]
 )  # if project requires model list
 async def model_list(
+    request: fastapi.Request,
     user_api_key_dict: UserAPIKeyAuth = Depends(user_api_key_auth),
     return_wildcard_routes: Optional[bool] = False,
     team_id: Optional[str] = None,
@@ -7625,8 +7626,10 @@ async def model_list(
         _user_has_admin_privileges,
     )
     from litellm.proxy.utils import (
+        create_anthropic_model_list_response,
         create_model_info_response,
         get_available_models_for_user,
+        should_return_anthropic_model_list,
     )
 
     # Validate scope parameter if provided
@@ -7690,6 +7693,9 @@ async def model_list(
             )
             model_data.append(model_info)
 
+        if should_return_anthropic_model_list(request.headers):
+            return create_anthropic_model_list_response(model_data=model_data)
+
         return dict(
             data=model_data,
             object="list",
@@ -7722,6 +7728,9 @@ async def model_list(
             llm_router=llm_router,
         )
         model_data.append(model_info)
+
+    if should_return_anthropic_model_list(request.headers):
+        return create_anthropic_model_list_response(model_data=model_data)
 
     return dict(
         data=model_data,

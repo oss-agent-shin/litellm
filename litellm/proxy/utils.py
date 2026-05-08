@@ -20,6 +20,7 @@ from typing import (
     Dict,
     List,
     Literal,
+    Mapping,
     Optional,
     Union,
     cast,
@@ -5871,6 +5872,65 @@ def create_model_info_response(
         model_info["metadata"] = metadata
 
     return model_info
+
+
+def should_return_anthropic_model_list(headers: Mapping[str, str]) -> bool:
+    """
+    Detect clients that expect Anthropic's native /v1/models response shape.
+    """
+    user_agent = headers.get("user-agent", "").lower()
+    return "claude-code" in user_agent or bool(headers.get("anthropic-version"))
+
+
+def _format_anthropic_model_display_name(model_id: str) -> str:
+    display_name_parts: List[str] = []
+    raw_parts = model_id.replace("_", "-").split("-")
+    idx = 0
+    while idx < len(raw_parts):
+        part = raw_parts[idx]
+        next_part = raw_parts[idx + 1] if idx + 1 < len(raw_parts) else None
+        if part.isdigit() and next_part is not None and next_part.isdigit():
+            display_name_parts.append(f"{part}.{next_part}")
+            idx += 2
+            continue
+        display_name_parts.append(part.capitalize())
+        idx += 1
+
+    return " ".join(display_name_parts)
+
+
+def _format_anthropic_model_created_at(created: object) -> str:
+    created_timestamp = (
+        created if isinstance(created, int) else DEFAULT_MODEL_CREATED_AT_TIME
+    )
+    return (
+        datetime.fromtimestamp(created_timestamp, timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def create_anthropic_model_list_response(model_data: List[dict]) -> dict:
+    """
+    Convert LiteLLM's OpenAI-compatible model list into Anthropic's native shape.
+    """
+    anthropic_models = [
+        {
+            "type": "model",
+            "id": model_info["id"],
+            "display_name": _format_anthropic_model_display_name(model_info["id"]),
+            "created_at": _format_anthropic_model_created_at(model_info.get("created")),
+        }
+        for model_info in model_data
+    ]
+
+    return {
+        "data": anthropic_models,
+        "has_more": False,
+        "first_id": anthropic_models[0]["id"] if anthropic_models else None,
+        "last_id": anthropic_models[-1]["id"] if anthropic_models else None,
+    }
 
 
 def validate_model_access(
