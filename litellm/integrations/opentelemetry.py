@@ -869,12 +869,22 @@ class OpenTelemetry(OTELGenAISemconvMixin, CustomLogger):
     def _make_hashable(value: object) -> object:
         """Convert a value to a hashable form so it can be used in a dict key.
 
-        Lists are converted to tuples (recursively). All other types are
-        returned as-is; callers are responsible for passing only primitives,
-        ``None``, or collections of those.
+        Recursively converts unhashable collection types:
+        - ``list``  → ``tuple``
+        - ``dict``  → sorted ``tuple`` of ``(key, value)`` pairs
+        - ``set``   → ``frozenset``
+
+        All other types are returned as-is.  The recursion handles
+        nested structures such as ``[[1, 2], [3, 4]]``.
         """
         if isinstance(value, list):
             return tuple(OpenTelemetry._make_hashable(v) for v in value)
+        if isinstance(value, dict):
+            return tuple(
+                sorted((k, OpenTelemetry._make_hashable(v)) for k, v in value.items())
+            )
+        if isinstance(value, set):
+            return frozenset(OpenTelemetry._make_hashable(v) for v in value)
         return value
 
     def _emit_once(self, kwargs: dict, *scope: object) -> bool:

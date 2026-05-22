@@ -121,12 +121,33 @@ class TestOpenTelemetryEmitOnce(unittest.TestCase):
     """Tests for _emit_once deduplication and _make_hashable helper."""
 
     def test_make_hashable_converts_lists_to_tuples(self):
-        """_make_hashable must return tuples for lists and leave other types unchanged."""
+        """_make_hashable converts lists, dicts, and sets to hashable forms."""
+        # list → tuple
         assert OpenTelemetry._make_hashable(["a", "b"]) == ("a", "b")
         assert OpenTelemetry._make_hashable([1, [2, 3]]) == (1, (2, 3))
+
+        # dict → sorted tuple of (key, value) pairs
+        result = OpenTelemetry._make_hashable({"b": 2, "a": 1})
+        assert result == (("a", 1), ("b", 2))  # sorted by key
+
+        # set → frozenset
+        result = OpenTelemetry._make_hashable({1, 2, 3})
+        assert result == frozenset({1, 2, 3})
+
+        # passthrough for primitives
         assert OpenTelemetry._make_hashable("string") == "string"
         assert OpenTelemetry._make_hashable(42) == 42
         assert OpenTelemetry._make_hashable(None) is None
+
+        # all results must be hashable (usable as dict keys)
+        for value in [
+            ["a", "b"],
+            {"key": "val"},
+            {1, 2},
+            [{"nested": "dict"}],
+        ]:
+            result = OpenTelemetry._make_hashable(value)
+            hash(result)  # must not raise
 
     def test_emit_once_deduplication_with_list_scope(self):
         """_emit_once must not raise when a list appears in scope (list guardrail_mode)."""
