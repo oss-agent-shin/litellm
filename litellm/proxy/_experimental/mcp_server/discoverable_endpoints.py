@@ -1,4 +1,5 @@
 import json
+from html import escape
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
@@ -618,8 +619,124 @@ async def token_endpoint(
     )
 
 
+def _render_callback_error_page(
+    err_code: str, err_desc: Optional[str], status_code: int = 400
+) -> HTMLResponse:
+    """Render a user-facing HTML page for an OAuth callback error.
+
+    Used when we cannot redirect the user back to a trusted client
+    redirect_uri (state missing, state undecryptable, or the encoded
+    redirect_uri failed re-validation). The page is plain HTML so the
+    user understands what happened; the MCP client polling the loopback
+    redirect will time out separately, which is the existing behaviour
+    for any non-redirect callback response.
+    """
+    safe_err = escape(err_code)
+    safe_desc = escape(err_desc) if err_desc else ""
+    parts = [
+        "<html><body>",
+        "<h1>Authentication failed</h1>",
+        f"<p><strong>Error:</strong> {safe_err}</p>",
+    ]
+    if safe_desc:
+        parts.append(f"<p>{safe_desc}</p>")
+    parts.append("<p>You can close this window.</p></body></html>")
+    return HTMLResponse(content="".join(parts), status_code=status_code)
+
+
 @router.get("/callback")
-async def callback(request: Request, code: str, state: str):
+async def callback(
+    request: Request,
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    error: Optional[str] = None,
+    error_description: Optional[str] = None,
+    error_uri: Optional[str] = None,
+):
+    """OAuth 2.0 authorization-code callback endpoint.
+
+    Handles three cases:
+
+    1. **Success** — IdP returns ``?code=<...>&state=<encrypted>``. We decode
+       state, re-validate the client redirect_uri, and 302 back with the code.
+
+    2. **IdP error response** — IdP returns
+       ``?error=access_denied&error_description=...&state=<...>`` (per RFC 6749
+       §4.1.2.1). We propagate ``error`` / ``error_description`` / ``error_uri``
+       / ``state`` back to the client's registered redirect_uri so the MCP
+       client (or browser app) can surface the failure instead of timing out.
+
+    3. **Missing code without explicit error** — an SSO redirect chain dropped
+       the IdP's query parameters, or the IdP misbehaved. Treated as an
+       ``invalid_request`` error so the user sees a readable message rather
+       than the Pydantic 422 JSON that used to fall out of FastAPI here
+       (LIT-2750).
+
+    Returns a 302 when we can identify a trusted client redirect_uri to bounce
+    the user back to; otherwise a 400 HTML page. The previous behaviour — a
+    422 JSON response from FastAPI's request validator — left the user on an
+    opaque page and caused MCP clients to hang waiting for the loopback
+    redirect.
+    """
+    is_error_response = bool(error) or not code
+
+    if is_error_response:
+        # Normalize: "no code, no error" is treated as an explicit
+        # invalid_request — the user can't continue regardless of which
+        # of the two upstream causes triggered it.
+        err_code = error or "invalid_request"
+        err_desc = error_description or (
+            None
+            if error
+            else "Authorization code was not returned by the identity provider."
+        )
+
+        # Try to decode the state so we can redirect the user back to the
+        # client's registered redirect_uri (RFC 6749 §4.1.2.1). We must NOT
+        # raise on a missing/invalid state — the user's browser is on this
+        # page and deserves a readable response, not a 422.
+        if state:
+            try:
+                state_data = decode_state_hash(state)
+                original_state = state_data.get("original_state", "")
+                # Re-validate the redirect URI even on the error path: a
+                # hostile state must not be allowed to turn the callback
+                # into an open-redirect on errors. See VERIA-57.
+                redirect_uri = _get_validated_client_redirect_uri(
+                    request, state_data
+                )
+                error_params: Dict[str, str] = {"error": err_code}
+                if err_desc:
+                    error_params["error_description"] = err_desc
+                if error_uri:
+                    error_params["error_uri"] = error_uri
+                if original_state:
+                    error_params["state"] = original_state
+                complete_returned_url = _append_query_params(
+                    redirect_uri, error_params
+                )
+                return RedirectResponse(
+                    url=complete_returned_url, status_code=302
+                )
+            except HTTPException:
+                # Redirect-URI re-validation rejected the decoded URI.
+                # Fall through to the HTML page rather than 4xx-ing the
+                # user's browser with raw JSON.
+                pass
+            except Exception:
+                # State undecryptable / malformed — fall through.
+                pass
+
+        return _render_callback_error_page(err_code, err_desc)
+
+    # Success path: ``code`` is present (state may still be missing — in
+    # which case we can't redirect anywhere, so render the same HTML page).
+    if not state:
+        return _render_callback_error_page(
+            "invalid_request",
+            "OAuth state parameter was not returned by the identity provider.",
+        )
+
     try:
         state_data = decode_state_hash(state)
         original_state = state_data["original_state"]
