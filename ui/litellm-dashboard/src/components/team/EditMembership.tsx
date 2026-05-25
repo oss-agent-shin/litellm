@@ -27,6 +27,7 @@ interface ModalConfig {
     step?: number;
     min?: number;
     placeholder?: string;
+    allowClear?: boolean;
   }>;
 }
 
@@ -67,6 +68,9 @@ const MemberModal = <T extends BaseMember>({
           rpm_limit: (initialData as any).rpm_limit || null,
           // Keep array values for multi-select fields
           allowed_models: (initialData as any).allowed_models || [],
+          // Pre-populate the current budget reset duration (if any) so the select
+          // reflects what is actually persisted instead of looking empty.
+          budget_duration: (initialData as any).budget_duration ?? undefined,
         };
         console.log("Setting form values:", formValues);
         form.setFieldsValue(formValues);
@@ -123,6 +127,7 @@ const MemberModal = <T extends BaseMember>({
     step?: number;
     min?: number;
     placeholder?: string;
+    allowClear?: boolean;
   }) => {
     switch (field.type) {
       case "input":
@@ -138,7 +143,7 @@ const MemberModal = <T extends BaseMember>({
         );
       case "select":
         return (
-          <Select>
+          <Select allowClear={field.allowClear} placeholder={field.placeholder}>
             {field.options?.map((option) => (
               <Select.Option key={option.value} value={option.value}>
                 {option.label}
