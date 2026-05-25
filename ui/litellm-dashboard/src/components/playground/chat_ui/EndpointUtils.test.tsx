@@ -1,6 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { ModelGroup } from "../llm_calls/fetch_models";
-import { determineEndpointType } from "./EndpointUtils";
+import {
+  determineEndpointType,
+  isModelCompatibleWithEndpoint,
+  pickDefaultModelForEndpoint,
+} from "./EndpointUtils";
 import { EndpointType } from "./mode_endpoint_mapping";
 
 // Mock the getEndpointType function
@@ -215,5 +219,112 @@ describe("determineEndpointType", () => {
 
     expect(getEndpointType).not.toHaveBeenCalled();
     expect(result).toBe(EndpointType.CHAT);
+  });
+});
+
+describe("isModelCompatibleWithEndpoint", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("treats a model with no mode as compatible with every endpoint type", () => {
+    const option: ModelGroup = { model_group: "no-mode-model" };
+    expect(isModelCompatibleWithEndpoint(option, EndpointType.CHAT)).toBe(true);
+    expect(isModelCompatibleWithEndpoint(option, EndpointType.IMAGE)).toBe(true);
+    expect(isModelCompatibleWithEndpoint(option, EndpointType.EMBEDDINGS)).toBe(true);
+    expect(getEndpointType).not.toHaveBeenCalled();
+  });
+
+  it("treats a model with an empty-string mode as compatible (falsy mode short-circuit)", () => {
+    const option: ModelGroup = { model_group: "blank-mode-model", mode: "" };
+    expect(isModelCompatibleWithEndpoint(option, EndpointType.CHAT)).toBe(true);
+    expect(getEndpointType).not.toHaveBeenCalled();
+  });
+
+  it("returns true when the mapped endpoint matches the requested one", () => {
+    vi.mocked(getEndpointType).mockReturnValue(EndpointType.CHAT);
+    const option: ModelGroup = { model_group: "gpt-4", mode: "chat" };
+    expect(isModelCompatibleWithEndpoint(option, EndpointType.CHAT)).toBe(true);
+  });
+
+  it("returns false when the mapped endpoint does not match", () => {
+    vi.mocked(getEndpointType).mockReturnValue(EndpointType.IMAGE);
+    const option: ModelGroup = { model_group: "dall-e-3", mode: "image_generation" };
+    expect(isModelCompatibleWithEndpoint(option, EndpointType.CHAT)).toBe(false);
+  });
+
+  it("allows chat models on responses/anthropic_messages/interactions endpoints", () => {
+    vi.mocked(getEndpointType).mockReturnValue(EndpointType.CHAT);
+    const chatModel: ModelGroup = { model_group: "gpt-4", mode: "chat" };
+    expect(isModelCompatibleWithEndpoint(chatModel, EndpointType.RESPONSES)).toBe(true);
+    expect(isModelCompatibleWithEndpoint(chatModel, EndpointType.ANTHROPIC_MESSAGES)).toBe(true);
+    expect(isModelCompatibleWithEndpoint(chatModel, "interactions")).toBe(true);
+  });
+
+  it("allows responses-mode models on the responses endpoint", () => {
+    vi.mocked(getEndpointType).mockReturnValue(EndpointType.RESPONSES);
+    const option: ModelGroup = { model_group: "o1", mode: "responses" };
+    expect(isModelCompatibleWithEndpoint(option, EndpointType.RESPONSES)).toBe(true);
+  });
+
+  it("allows image models on the image_edits endpoint as well as on image", () => {
+    vi.mocked(getEndpointType).mockReturnValue(EndpointType.IMAGE);
+    const option: ModelGroup = { model_group: "dall-e-3", mode: "image_generation" };
+    expect(isModelCompatibleWithEndpoint(option, EndpointType.IMAGE_EDITS)).toBe(true);
+    expect(isModelCompatibleWithEndpoint(option, EndpointType.IMAGE)).toBe(true);
+  });
+
+  it("rejects unrelated modes on the image_edits endpoint", () => {
+    vi.mocked(getEndpointType).mockReturnValue(EndpointType.CHAT);
+    const option: ModelGroup = { model_group: "gpt-4", mode: "chat" };
+    expect(isModelCompatibleWithEndpoint(option, EndpointType.IMAGE_EDITS)).toBe(false);
+  });
+});
+
+describe("pickDefaultModelForEndpoint", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("returns undefined when the model list is empty", () => {
+    expect(pickDefaultModelForEndpoint([], EndpointType.CHAT)).toBeUndefined();
+    expect(getEndpointType).not.toHaveBeenCalled();
+  });
+
+  it("picks the first model that is compatible with the endpoint", () => {
+    vi.mocked(getEndpointType).mockImplementation((mode: string) =>
+      mode === "chat" ? EndpointType.CHAT : EndpointType.IMAGE,
+    );
+    const models: ModelGroup[] = [
+      { model_group: "dall-e-3", mode: "image_generation" },
+      { model_group: "gpt-4o-mini", mode: "chat" },
+    ];
+    expect(pickDefaultModelForEndpoint(models, EndpointType.CHAT)).toBe("gpt-4o-mini");
+  });
+
+  it("falls back to the first model when none have a compatible mode", () => {
+    vi.mocked(getEndpointType).mockReturnValue(EndpointType.IMAGE);
+    const models: ModelGroup[] = [
+      { model_group: "dall-e-3", mode: "image_generation" },
+      { model_group: "stable-diffusion", mode: "image_generation" },
+    ];
+    expect(pickDefaultModelForEndpoint(models, EndpointType.CHAT)).toBe("dall-e-3");
+  });
+
+  it("prefers a mode-less model over a mismatched one", () => {
+    vi.mocked(getEndpointType).mockReturnValue(EndpointType.CHAT);
+    const models: ModelGroup[] = [
+      { model_group: "mystery-model" },
+      { model_group: "gpt-4", mode: "chat" },
+    ];
+    expect(pickDefaultModelForEndpoint(models, EndpointType.EMBEDDINGS)).toBe("mystery-model");
+  });
+
+  it("returns the only model when the list has exactly one compatible entry", () => {
+    vi.mocked(getEndpointType).mockReturnValue(EndpointType.EMBEDDINGS);
+    const models: ModelGroup[] = [{ model_group: "text-embedding-3-small", mode: "embedding" }];
+    expect(pickDefaultModelForEndpoint(models, EndpointType.EMBEDDINGS)).toBe(
+      "text-embedding-3-small",
+    );
   });
 });
