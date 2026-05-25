@@ -157,3 +157,209 @@ def test_virtual_key_rate_limit_metrics_preserve_zero_remaining_values(
     assert any(sample.value == 0 for sample in token_samples)
     assert not any(sample.value == sys.maxsize for sample in request_samples)
     assert not any(sample.value == sys.maxsize for sample in token_samples)
+
+
+
+def test_virtual_key_rate_limit_metrics_fallback_to_additional_headers(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """LIT-2577: when the legacy ``litellm-key-remaining-{requests,tokens}-{model_group}``
+    keys are missing from ``metadata`` (the v3 ``parallel_request_limiter_v3``
+    path), the gauges must read from
+    ``standard_logging_payload.hidden_params.additional_headers`` instead of
+    falling back to ``sys.maxsize`` (~9.22e18).
+    """
+    prometheus_logger = _create_prometheus_logger_with_custom_labels(monkeypatch)
+    # Legacy metadata location: empty. Only model_group present.
+    metadata = {"model_group": "gpt-4o-mini"}
+
+    standard_logging_payload = _standard_logging_payload_with_requester_metadata()
+    standard_logging_payload["hidden_params"] = {
+        "additional_headers": {
+            "x-ratelimit-model_per_key-remaining-requests": 7,
+            "x-ratelimit-model_per_key-remaining-tokens": 1234,
+            "x-ratelimit-model_per_key-limit-requests": 10,
+            "x-ratelimit-model_per_key-limit-tokens": 2000,
+        }
+    }
+
+    kwargs = {
+        "litellm_params": {"metadata": metadata},
+        "standard_logging_object": standard_logging_payload,
+    }
+
+    prometheus_logger._set_virtual_key_rate_limit_metrics(
+        user_api_key="test-hash",
+        user_api_key_alias="test-alias",
+        kwargs=kwargs,
+        metadata=metadata,
+        model_id="model-123",
+    )
+
+    request_samples = _metric_samples("litellm_remaining_api_key_requests_for_model")
+    token_samples = _metric_samples("litellm_remaining_api_key_tokens_for_model")
+
+    assert any(sample.value == 7 for sample in request_samples), (
+        "remaining-requests should come from additional_headers fallback, "
+        f"got samples={[s.value for s in request_samples]}"
+    )
+    assert any(sample.value == 1234 for sample in token_samples), (
+        "remaining-tokens should come from additional_headers fallback, "
+        f"got samples={[s.value for s in token_samples]}"
+    )
+    # And critically, no sys.maxsize leakage.
+    assert not any(sample.value == sys.maxsize for sample in request_samples)
+    assert not any(sample.value == sys.maxsize for sample in token_samples)
+
+
+def test_virtual_key_rate_limit_metrics_metadata_takes_precedence_over_headers(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """When both legacy metadata keys and additional_headers are populated,
+    metadata wins. Guards against regressing the v1 limiter behaviour.
+    """
+    prometheus_logger = _create_prometheus_logger_with_custom_labels(monkeypatch)
+    metadata = {
+        "model_group": "gpt-4o-mini",
+        "litellm-key-remaining-requests-gpt-4o-mini": 3,
+        "litellm-key-remaining-tokens-gpt-4o-mini": 200,
+    }
+
+    standard_logging_payload = _standard_logging_payload_with_requester_metadata()
+    standard_logging_payload["hidden_params"] = {
+        "additional_headers": {
+            "x-ratelimit-model_per_key-remaining-requests": 99,
+            "x-ratelimit-model_per_key-remaining-tokens": 9999,
+        }
+    }
+
+    kwargs = {
+        "litellm_params": {"metadata": metadata},
+        "standard_logging_object": standard_logging_payload,
+    }
+
+    prometheus_logger._set_virtual_key_rate_limit_metrics(
+        user_api_key="test-hash",
+        user_api_key_alias="test-alias",
+        kwargs=kwargs,
+        metadata=metadata,
+        model_id="model-123",
+    )
+
+    request_samples = _metric_samples("litellm_remaining_api_key_requests_for_model")
+    token_samples = _metric_samples("litellm_remaining_api_key_tokens_for_model")
+
+    assert any(sample.value == 3 for sample in request_samples)
+    assert any(sample.value == 200 for sample in token_samples)
+    assert not any(sample.value == 99 for sample in request_samples)
+    assert not any(sample.value == 9999 for sample in token_samples)
+
+
+def test_virtual_key_rate_limit_metrics_partial_metadata_fills_from_headers(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """If only one of remaining-requests/tokens is in metadata, the other
+    should still be picked up from additional_headers."""
+    prometheus_logger = _create_prometheus_logger_with_custom_labels(monkeypatch)
+    metadata = {
+        "model_group": "gpt-4o-mini",
+        "litellm-key-remaining-requests-gpt-4o-mini": 5,
+        # tokens deliberately absent
+    }
+
+    standard_logging_payload = _standard_logging_payload_with_requester_metadata()
+    standard_logging_payload["hidden_params"] = {
+        "additional_headers": {
+            "x-ratelimit-model_per_key-remaining-tokens": 42,
+        }
+    }
+
+    kwargs = {
+        "litellm_params": {"metadata": metadata},
+        "standard_logging_object": standard_logging_payload,
+    }
+
+    prometheus_logger._set_virtual_key_rate_limit_metrics(
+        user_api_key="test-hash",
+        user_api_key_alias="test-alias",
+        kwargs=kwargs,
+        metadata=metadata,
+        model_id="model-123",
+    )
+
+    request_samples = _metric_samples("litellm_remaining_api_key_requests_for_model")
+    token_samples = _metric_samples("litellm_remaining_api_key_tokens_for_model")
+
+    assert any(sample.value == 5 for sample in request_samples)
+    assert any(sample.value == 42 for sample in token_samples)
+    assert not any(sample.value == sys.maxsize for sample in token_samples)
+
+
+def test_virtual_key_rate_limit_metrics_no_data_anywhere_falls_back_to_maxsize(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """If neither metadata nor additional_headers have values, the original
+    ``sys.maxsize`` sentinel is preserved (we only want to remove the false
+    sentinel when real data is available)."""
+    prometheus_logger = _create_prometheus_logger_with_custom_labels(monkeypatch)
+    metadata = {"model_group": "gpt-4o-mini"}
+
+    standard_logging_payload = _standard_logging_payload_with_requester_metadata()
+    standard_logging_payload["hidden_params"] = {"additional_headers": {}}
+
+    kwargs = {
+        "litellm_params": {"metadata": metadata},
+        "standard_logging_object": standard_logging_payload,
+    }
+
+    prometheus_logger._set_virtual_key_rate_limit_metrics(
+        user_api_key="test-hash",
+        user_api_key_alias="test-alias",
+        kwargs=kwargs,
+        metadata=metadata,
+        model_id="model-123",
+    )
+
+    request_samples = _metric_samples("litellm_remaining_api_key_requests_for_model")
+    token_samples = _metric_samples("litellm_remaining_api_key_tokens_for_model")
+
+    assert any(sample.value == float(sys.maxsize) for sample in request_samples)
+    assert any(sample.value == float(sys.maxsize) for sample in token_samples)
+
+
+def test_virtual_key_rate_limit_metrics_zero_remaining_in_headers_preserved(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Zero is a meaningful value (key/model is exhausted) and must not be
+    treated as ``None`` by ``or``-coalescing logic."""
+    prometheus_logger = _create_prometheus_logger_with_custom_labels(monkeypatch)
+    metadata = {"model_group": "gpt-4o-mini"}
+
+    standard_logging_payload = _standard_logging_payload_with_requester_metadata()
+    standard_logging_payload["hidden_params"] = {
+        "additional_headers": {
+            "x-ratelimit-model_per_key-remaining-requests": 0,
+            "x-ratelimit-model_per_key-remaining-tokens": 0,
+        }
+    }
+
+    kwargs = {
+        "litellm_params": {"metadata": metadata},
+        "standard_logging_object": standard_logging_payload,
+    }
+
+    prometheus_logger._set_virtual_key_rate_limit_metrics(
+        user_api_key="test-hash",
+        user_api_key_alias="test-alias",
+        kwargs=kwargs,
+        metadata=metadata,
+        model_id="model-123",
+    )
+
+    request_samples = _metric_samples("litellm_remaining_api_key_requests_for_model")
+    token_samples = _metric_samples("litellm_remaining_api_key_tokens_for_model")
+
+    assert any(sample.value == 0 for sample in request_samples)
+    assert any(sample.value == 0 for sample in token_samples)
+    assert not any(sample.value == sys.maxsize for sample in request_samples)
+    assert not any(sample.value == sys.maxsize for sample in token_samples)
