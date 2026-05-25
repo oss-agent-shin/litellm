@@ -2780,6 +2780,26 @@ async def _run_direct_health_check_with_instrumentation(
     raise last_type_error
 
 
+def _is_background_health_check_db_save_disabled() -> bool:
+    """Return True when the operator has opted out of background-loop DB writes.
+
+    Honors ``general_settings.disable_background_health_check_db_save`` (default
+    False to preserve existing behavior). Accepts bool or string "true"/"false"
+    so a config loaded from YAML or DB overlay behaves the same.
+    """
+    try:
+        raw = (general_settings or {}).get(
+            "disable_background_health_check_db_save", False
+        )
+    except Exception:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        return raw.strip().lower() == "true"
+    return bool(raw)
+
+
 def _schedule_background_health_check_db_save(
     prisma_client,
     shared_health_manager,
@@ -2787,8 +2807,21 @@ def _schedule_background_health_check_db_save(
     healthy_endpoints: list,
     unhealthy_endpoints: list,
 ):
-    """Fire-and-forget: persist health check results to DB if prisma is available."""
+    """Fire-and-forget: persist background health check results to ``LiteLLM_HealthCheckTable``.
+
+    No-op when:
+    - ``prisma_client`` is unset (no DB configured), or
+    - ``general_settings.disable_background_health_check_db_save`` is truthy.
+
+    The second case is the operator escape hatch for clusters where the per-cycle
+    SELECT + INSERT pressure from the background loop is overloading the database
+    (e.g. Aurora ACU climbing to 100% on deployments with many models). It only
+    disables writes from the *background* loop -- explicit ``GET /health`` requests
+    still persist their results.
+    """
     if prisma_client is None:
+        return
+    if _is_background_health_check_db_save_disabled():
         return
     import time as time_module
 
