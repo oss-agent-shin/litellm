@@ -166,6 +166,53 @@ class PrometheusLogger(CustomLogger):
                 labelnames=self.get_labels_for_metric("litellm_output_tokens_metric"),
             )
 
+            # Token-type detail metrics. These break out cached, cache-creation,
+            # audio and reasoning tokens that providers report inside
+            # prompt_tokens_details / completion_tokens_details on the usage
+            # object. They are sparse (only incremented when the provider
+            # reports a non-zero value) and are additive to the existing
+            # input/output token totals — no breaking change for existing
+            # dashboards built on the totals.
+            self.litellm_input_cached_tokens_metric = self._counter_factory(
+                "litellm_input_cached_tokens_metric",
+                "Provider-side cached input tokens (e.g. OpenAI prompt_tokens_details.cached_tokens, Anthropic cache_read_input_tokens)",
+                labelnames=self.get_labels_for_metric(
+                    "litellm_input_cached_tokens_metric"
+                ),
+            )
+
+            self.litellm_input_cache_creation_tokens_metric = self._counter_factory(
+                "litellm_input_cache_creation_tokens_metric",
+                "Provider-side input tokens written to prompt cache (e.g. Anthropic cache_creation_input_tokens)",
+                labelnames=self.get_labels_for_metric(
+                    "litellm_input_cache_creation_tokens_metric"
+                ),
+            )
+
+            self.litellm_input_audio_tokens_metric = self._counter_factory(
+                "litellm_input_audio_tokens_metric",
+                "Audio input tokens reported in prompt_tokens_details.audio_tokens",
+                labelnames=self.get_labels_for_metric(
+                    "litellm_input_audio_tokens_metric"
+                ),
+            )
+
+            self.litellm_output_reasoning_tokens_metric = self._counter_factory(
+                "litellm_output_reasoning_tokens_metric",
+                "Reasoning tokens reported in completion_tokens_details.reasoning_tokens",
+                labelnames=self.get_labels_for_metric(
+                    "litellm_output_reasoning_tokens_metric"
+                ),
+            )
+
+            self.litellm_output_audio_tokens_metric = self._counter_factory(
+                "litellm_output_audio_tokens_metric",
+                "Audio output tokens reported in completion_tokens_details.audio_tokens",
+                labelnames=self.get_labels_for_metric(
+                    "litellm_output_audio_tokens_metric"
+                ),
+            )
+
             # Remaining Budget for Team
             self.litellm_remaining_team_budget_metric = self._gauge_factory(
                 "litellm_remaining_team_budget_metric",
@@ -1301,6 +1348,101 @@ class PrometheusLogger(CustomLogger):
             amount=float(standard_logging_payload["completion_tokens"]),
         )
 
+        # Token-type detail metrics — sparse, only emitted when the provider
+        # reports a non-zero value in usage.prompt_tokens_details /
+        # usage.completion_tokens_details.
+        self._increment_token_detail_metrics(
+            standard_logging_payload=standard_logging_payload,
+            enum_values=enum_values,
+            label_context=label_context,
+        )
+
+    def _increment_token_detail_metrics(
+        self,
+        standard_logging_payload: StandardLoggingPayload,
+        enum_values: UserAPIKeyLabelValues,
+        label_context: Optional[PrometheusLabelFactoryContext] = None,
+    ) -> None:
+        """
+        Increment per-token-type counters from the Usage object that providers
+        attach to the request. The Usage dict is plumbed onto
+        ``standard_logging_payload["metadata"]["usage_object"]`` by
+        ``get_standard_logging_object_payload``.
+
+        Each counter is only incremented when the underlying value is > 0, so
+        scrape output stays sparse for providers that don't report these
+        details (most non-OpenAI/Anthropic models).
+        """
+        metadata = standard_logging_payload.get("metadata") or {}
+        usage_object = (
+            metadata.get("usage_object") if isinstance(metadata, dict) else None
+        )
+        if not isinstance(usage_object, dict):
+            return
+
+        prompt_details = usage_object.get("prompt_tokens_details") or {}
+        completion_details = usage_object.get("completion_tokens_details") or {}
+
+        detail_metrics: List[Tuple[Any, DEFINED_PROMETHEUS_METRICS, Any]] = [
+            (
+                self.litellm_input_cached_tokens_metric,
+                "litellm_input_cached_tokens_metric",
+                (
+                    prompt_details.get("cached_tokens")
+                    if isinstance(prompt_details, dict)
+                    else None
+                ),
+            ),
+            (
+                self.litellm_input_cache_creation_tokens_metric,
+                "litellm_input_cache_creation_tokens_metric",
+                (
+                    prompt_details.get("cache_creation_tokens")
+                    if isinstance(prompt_details, dict)
+                    else None
+                ),
+            ),
+            (
+                self.litellm_input_audio_tokens_metric,
+                "litellm_input_audio_tokens_metric",
+                (
+                    prompt_details.get("audio_tokens")
+                    if isinstance(prompt_details, dict)
+                    else None
+                ),
+            ),
+            (
+                self.litellm_output_reasoning_tokens_metric,
+                "litellm_output_reasoning_tokens_metric",
+                (
+                    completion_details.get("reasoning_tokens")
+                    if isinstance(completion_details, dict)
+                    else None
+                ),
+            ),
+            (
+                self.litellm_output_audio_tokens_metric,
+                "litellm_output_audio_tokens_metric",
+                (
+                    completion_details.get("audio_tokens")
+                    if isinstance(completion_details, dict)
+                    else None
+                ),
+            ),
+        ]
+
+        for counter, metric_name, value in detail_metrics:
+            if not isinstance(value, (int, float)) or value <= 0:
+                continue
+            PrometheusLogger._inc_labeled_counter(
+                self,
+                counter,
+                metric_name,
+                enum_values,
+                label_context=label_context,
+                amount=float(value),
+            )
+
     def _increment_cache_metrics(
         self,
         standard_logging_payload: StandardLoggingPayload,
@@ -1434,6 +1576,45 @@ class PrometheusLogger(CustomLogger):
             amount=float(response_cost),
         )
 
+    @staticmethod
+    def _get_v3_additional_headers_from_kwargs(kwargs: dict) -> dict:
+        """Return ``additional_headers`` written by the v3 parallel-request rate
+        limiter, or ``{}`` if not available.
+
+        The v3 limiter (``litellm/proxy/hooks/parallel_request_limiter_v3.py``)
+        writes per-descriptor remaining/limit values into
+        ``response._hidden_params["additional_headers"]`` after the request
+        runs, using keys like ``x-ratelimit-model_per_key-remaining-tokens``
+        and ``x-ratelimit-model_per_key-remaining-requests``. Those flow into
+        ``standard_logging_object.hidden_params.additional_headers``.
+
+        Defensive against partial/non-dict payloads so this metrics callback
+        cannot fail the request.
+        """
+        try:
+            slp = kwargs.get("standard_logging_object") or {}
+            if not isinstance(slp, dict):
+                return {}
+            hidden_params = slp.get("hidden_params") or {}
+            if not isinstance(hidden_params, dict):
+                return {}
+            additional_headers = hidden_params.get("additional_headers") or {}
+            if not isinstance(additional_headers, dict):
+                return {}
+            if additional_headers:
+                return additional_headers
+
+            # Defensive fallback: read straight off the response if present.
+            response_obj = kwargs.get("response_obj")
+            response_hidden = getattr(response_obj, "_hidden_params", None)
+            if isinstance(response_hidden, dict):
+                resp_additional = response_hidden.get("additional_headers") or {}
+                if isinstance(resp_additional, dict):
+                    return resp_additional
+        except Exception:
+            return {}
+        return {}
+
     def _set_virtual_key_rate_limit_metrics(
         self,
         user_api_key: Optional[str],
@@ -1446,18 +1627,43 @@ class PrometheusLogger(CustomLogger):
             get_model_group_from_litellm_kwargs,
         )
 
-        # Set remaining rpm/tpm for API Key + model
-        # see parallel_request_limiter.py - variables are set there
+        # Set remaining rpm/tpm for API Key + model.
+        #
+        # Source priority:
+        #   1. v3 rate limiter writes per-model-per-key remaining values into
+        #      ``response._hidden_params["additional_headers"]`` under
+        #      ``x-ratelimit-model_per_key-remaining-{requests,tokens}``.
+        #      Those flow into ``standard_logging_object.hidden_params.additional_headers``.
+        #      See ``litellm/proxy/hooks/parallel_request_limiter_v3.py``.
+        #   2. v1 legacy rate limiter writes them into ``metadata`` under
+        #      ``litellm-key-remaining-{requests,tokens}-{model_group}``.
+        #      See ``litellm/proxy/hooks/parallel_request_limiter.py``.
+        #   3. Fall back to ``sys.maxsize`` so the gauge still reports an
+        #      "unbounded" value when neither limiter populated anything.
         model_group = get_model_group_from_litellm_kwargs(kwargs)
         remaining_requests_variable_name = (
             f"litellm-key-remaining-requests-{model_group}"
         )
         remaining_tokens_variable_name = f"litellm-key-remaining-tokens-{model_group}"
 
-        remaining_requests = metadata.get(remaining_requests_variable_name)
+        additional_headers = self._get_v3_additional_headers_from_kwargs(kwargs)
+
+        # ``is None`` (not truthiness) so a legitimate ``0`` remaining value
+        # -- the key/model is exactly at its quota -- isn't silently replaced
+        # with ``sys.maxsize``.
+        remaining_requests = additional_headers.get(
+            "x-ratelimit-model_per_key-remaining-requests"
+        )
+        if remaining_requests is None:
+            remaining_requests = metadata.get(remaining_requests_variable_name)
         if remaining_requests is None:
             remaining_requests = sys.maxsize
-        remaining_tokens = metadata.get(remaining_tokens_variable_name)
+
+        remaining_tokens = additional_headers.get(
+            "x-ratelimit-model_per_key-remaining-tokens"
+        )
+        if remaining_tokens is None:
+            remaining_tokens = metadata.get(remaining_tokens_variable_name)
         if remaining_tokens is None:
             remaining_tokens = sys.maxsize
 
