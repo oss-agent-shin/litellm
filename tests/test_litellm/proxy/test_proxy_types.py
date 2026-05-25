@@ -69,3 +69,56 @@ def test_internal_jobs_user_has_proxy_admin_role():
     assert system_user.user_id == "system"
     assert system_user.team_id == "system"
     assert system_user.team_alias == "system"
+
+
+def test_proxy_exception_message_propagates_to_str():
+    """
+    Regression test for LIT-3094.
+
+    ProxyException must pass its message to Python's base Exception so that
+    str(exception) and exception.args are populated. Otherwise downstream
+    logging that does `error_message = str(original_exception)` (see
+    StandardLoggingPayloadSetup.get_error_information) records an empty
+    error_message for things like 401 auth failures.
+    """
+    from litellm.proxy._types import ProxyException
+
+    msg = "key not allowed to access model. This key can only access models=['a']. Tried to access b"
+    exc = ProxyException(message=msg, type="auth_error", param="model", code=401)
+
+    # The fix: message must flow to the base Exception.
+    assert str(exc) == msg
+    assert exc.args == (msg,)
+
+    # Existing attributes must keep working unchanged.
+    assert exc.message == msg
+    assert exc.type == "auth_error"
+    assert exc.param == "model"
+    assert exc.code == "401"
+    assert exc.to_dict() == {
+        "message": msg,
+        "type": "auth_error",
+        "param": "model",
+        "code": "401",
+    }
+
+
+def test_proxy_exception_message_flows_into_logging_payload():
+    """
+    End-to-end regression for LIT-3094: the auth-failure message that the
+    NVIDIA customer saw as empty `error_message` should now be populated in
+    the StandardLoggingPayload error information.
+    """
+    from litellm.litellm_core_utils.litellm_logging import (
+        StandardLoggingPayloadSetup,
+    )
+    from litellm.proxy._types import ProxyException
+
+    msg = "key not allowed to access model. This key can only access models=['gpt-4o']. Tried to access gpt-5"
+    exc = ProxyException(message=msg, type="auth_error", param="model", code=401)
+
+    info = StandardLoggingPayloadSetup.get_error_information(exc)
+
+    assert info["error_message"] == msg
+    assert info["error_code"] == "401"
+    assert info["error_class"] == "ProxyException"
