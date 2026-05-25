@@ -550,6 +550,7 @@ from fastapi import (
     status,
 )
 from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.openapi.utils import get_openapi
@@ -1209,12 +1210,66 @@ async def openai_exception_handler(request: Request, exc: ProxyException):
     # NOTE: DO NOT MODIFY THIS, its crucial to map to Openai exceptions
     headers = exc.headers
     error_dict = exc.to_dict()
+    status_code = int(exc.code) if exc.code else status.HTTP_500_INTERNAL_SERVER_ERROR
+    _close_dangling_otel_server_span(request, status_code)
     return JSONResponse(
-        status_code=(
-            int(exc.code) if exc.code else status.HTTP_500_INTERNAL_SERVER_ERROR
-        ),
+        status_code=status_code,
         content={"error": error_dict},
         headers=headers,
+    )
+
+
+def _close_dangling_otel_server_span(request: Request, status_code: int) -> None:
+    parent_otel_span = getattr(request.state, "parent_otel_span", None)
+    if parent_otel_span is None:
+        return
+    if open_telemetry_logger is None:
+        return
+    try:
+        from opentelemetry.trace import Status, StatusCode
+
+        open_telemetry_logger.set_response_status_code_attribute(
+            parent_otel_span, status_code
+        )
+        parent_otel_span.set_status(
+            Status(StatusCode.ERROR if status_code >= 400 else StatusCode.OK)
+        )
+        parent_otel_span.end()
+    except Exception as e:
+        verbose_proxy_logger.debug(
+            "Error closing dangling OTEL SERVER span: %s", str(e)
+        )
+    finally:
+        request.state.parent_otel_span = None
+
+
+@app.exception_handler(RequestValidationError)
+async def otel_request_validation_exception_handler(
+    request: Request, exc: RequestValidationError
+):
+    _close_dangling_otel_server_span(request, 422)
+    return JSONResponse(
+        status_code=422,
+        content={"detail": jsonable_encoder(exc.errors())},
+    )
+
+
+@app.exception_handler(Exception)
+async def otel_unhandled_exception_handler(request: Request, exc: Exception):
+    if isinstance(exc, (ProxyException, HTTPException, RequestValidationError)):
+        raise exc
+    verbose_proxy_logger.exception(
+        "Unhandled exception in request: %s", type(exc).__name__
+    )
+    _close_dangling_otel_server_span(request, 500)
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": {
+                "message": "Internal server error",
+                "type": "internal_server_error",
+            }
+        },
     )
 
 
@@ -2710,11 +2765,9 @@ def run_ollama_serve():
         with open(os.devnull, "w") as devnull:
             subprocess.Popen(command, stdout=devnull, stderr=devnull)
     except Exception as e:
-        verbose_proxy_logger.debug(
-            f"""
+        verbose_proxy_logger.debug(f"""
             LiteLLM Warning: proxy started with `ollama` model\n`ollama serve` failed with Exception{e}. \nEnsure you run `ollama serve`
-        """
-        )
+        """)
 
 
 def _get_process_rss_mb() -> Optional[float]:
@@ -2780,6 +2833,26 @@ async def _run_direct_health_check_with_instrumentation(
     raise last_type_error
 
 
+def _is_background_health_check_db_save_disabled() -> bool:
+    """Return True when the operator has opted out of background-loop DB writes.
+
+    Honors ``general_settings.disable_background_health_check_db_save`` (default
+    False to preserve existing behavior). Accepts bool or string "true"/"false"
+    so a config loaded from YAML or DB overlay behaves the same.
+    """
+    try:
+        raw = (general_settings or {}).get(
+            "disable_background_health_check_db_save", False
+        )
+    except Exception:
+        return False
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        return raw.strip().lower() == "true"
+    return bool(raw)
+
+
 def _schedule_background_health_check_db_save(
     prisma_client,
     shared_health_manager,
@@ -2787,8 +2860,21 @@ def _schedule_background_health_check_db_save(
     healthy_endpoints: list,
     unhealthy_endpoints: list,
 ):
-    """Fire-and-forget: persist health check results to DB if prisma is available."""
+    """Fire-and-forget: persist background health check results to ``LiteLLM_HealthCheckTable``.
+
+    No-op when:
+    - ``prisma_client`` is unset (no DB configured), or
+    - ``general_settings.disable_background_health_check_db_save`` is truthy.
+
+    The second case is the operator escape hatch for clusters where the per-cycle
+    SELECT + INSERT pressure from the background loop is overloading the database
+    (e.g. Aurora ACU climbing to 100% on deployments with many models). It only
+    disables writes from the *background* loop -- explicit ``GET /health`` requests
+    still persist their results.
+    """
     if prisma_client is None:
+        return
+    if _is_background_health_check_db_save_disabled():
         return
     import time as time_module
 
@@ -4328,6 +4414,19 @@ class ProxyConfig:
                 "health_check_concurrency", None
             )
             health_check_details = general_settings.get("health_check_details", True)
+            ### INTERACTIONS API SCHEMA ###
+            _use_legacy_interactions_schema = general_settings.get(
+                "use_legacy_interactions_schema"
+            )
+            if _use_legacy_interactions_schema is not None:
+                if isinstance(_use_legacy_interactions_schema, str):
+                    litellm.use_legacy_interactions_schema = (
+                        _use_legacy_interactions_schema.lower() == "true"
+                    )
+                else:
+                    litellm.use_legacy_interactions_schema = bool(
+                        _use_legacy_interactions_schema
+                    )
             # Health-check-driven routing (opt-in, passes through to Router later)
             _enable_hc_routing = general_settings.get(
                 "enable_health_check_routing", False
