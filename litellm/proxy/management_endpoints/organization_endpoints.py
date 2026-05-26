@@ -670,6 +670,59 @@ async def delete_organization(
     return deleted_orgs
 
 
+async def _get_visible_org_ids_for_internal_user(
+    prisma_client: Any,
+    user_id: Optional[str],
+) -> List[str]:
+    """Return the set of organization_ids an internal (non-admin) user can see.
+
+    Visibility is the union of:
+      1. Orgs the user is a direct member of (LiteLLM_OrganizationMembership).
+      2. Orgs that own a team the user is a member of
+         (LiteLLM_UserTable.teams -> LiteLLM_TeamTable.organization_id).
+
+    The team-derived visibility is what lets the admin UI resolve the org alias
+    for an internal user whose team belongs to an org but who has not been
+    explicitly added as an org member (the BlackDuck case, issue #27640).
+
+    Returns a list of unique organization_ids, preserving membership order:
+    membership-derived orgs first, then team-derived.
+    """
+    if user_id is None:
+        return []
+
+    # 1. Direct org memberships
+    org_memberships = await prisma_client.db.litellm_organizationmembership.find_many(
+        where={"user_id": user_id}
+    )
+    ordered_ids: List[str] = []
+    seen: set = set()
+    for membership in org_memberships:
+        org_id_val = membership.organization_id
+        if org_id_val and org_id_val not in seen:
+            ordered_ids.append(org_id_val)
+            seen.add(org_id_val)
+
+    # 2. Orgs reachable via team membership.
+    # We use LiteLLM_UserTable.teams (the canonical per-user team list — same
+    # source used elsewhere, e.g. user info lookups in internal_user_endpoints).
+    user_row = await prisma_client.db.litellm_usertable.find_unique(
+        where={"user_id": user_id}
+    )
+    user_team_ids = list(getattr(user_row, "teams", None) or []) if user_row else []
+    if user_team_ids:
+        teams = await prisma_client.db.litellm_teamtable.find_many(
+            where={"team_id": {"in": user_team_ids}}
+        )
+        for team in teams:
+            team_org_id = getattr(team, "organization_id", None)
+            if team_org_id and team_org_id not in seen:
+                ordered_ids.append(team_org_id)
+                seen.add(team_org_id)
+
+    return ordered_ids
+
+
 @router.get(
     "/organization/list",
     tags=["organization management"],
@@ -736,23 +789,26 @@ async def list_organization(
             where=where_conditions if where_conditions else None,
             include={"litellm_budget_table": True, "members": True, "teams": True},
         )
-    # if internal user - get orgs they are a member of (with optional filters)
+    # if internal user - get orgs they have visibility into via either:
+    #   1. direct organization membership (LiteLLM_OrganizationMembership), or
+    #   2. team membership in a team that belongs to an organization
+    #
+    # (2) is needed so internal users see the *name* of the org that owns the
+    # team(s) they belong to — otherwise the UI (e.g. the Org column on the
+    # API keys page) only has the bare org_id from the key and falls back to
+    # rendering the UUID. See issue #27640.
     else:
-        org_memberships = (
-            await prisma_client.db.litellm_organizationmembership.find_many(
-                where={"user_id": user_api_key_dict.user_id}
-            )
+        visible_org_ids = await _get_visible_org_ids_for_internal_user(
+            prisma_client=prisma_client,
+            user_id=user_api_key_dict.user_id,
         )
-        membership_org_ids = [
-            membership.organization_id for membership in org_memberships
-        ]
 
-        # Combine membership filter with provided filters
-        if membership_org_ids:
+        # Combine visibility set with provided filters
+        if visible_org_ids:
             if org_id:
-                # If org_id is provided, ensure user is a member of that org
-                if org_id not in membership_org_ids:
-                    # User is not a member of the requested org, return empty list
+                # If org_id is provided, ensure user has visibility into that org
+                if org_id not in visible_org_ids:
+                    # User cannot see the requested org, return empty list
                     response = []
                 else:
                     where_conditions["organization_id"] = org_id
@@ -767,8 +823,8 @@ async def list_organization(
                         )
                     )
             else:
-                # Filter by membership and any additional filters
-                where_conditions["organization_id"] = {"in": membership_org_ids}
+                # Filter by visibility and any additional filters
+                where_conditions["organization_id"] = {"in": list(visible_org_ids)}
                 response = await prisma_client.db.litellm_organizationtable.find_many(
                     where=where_conditions,
                     include={
@@ -778,7 +834,7 @@ async def list_organization(
                     },
                 )
         else:
-            # User is not a member of any orgs
+            # User cannot see any orgs (no membership, no team-derived visibility)
             response = []
 
     return response
