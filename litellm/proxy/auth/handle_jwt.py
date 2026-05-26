@@ -22,7 +22,7 @@ import jwt
 from jwt.api_jwk import PyJWK
 
 from litellm._logging import verbose_proxy_logger
-from litellm.constants import DEFAULT_MANAGEMENT_OBJECT_IN_MEMORY_CACHE_TTL
+from litellm.proxy.auth.auth_checks import _management_object_cache_ttl
 from litellm.litellm_core_utils.dot_notation_indexing import get_nested_value
 from litellm.llms.custom_httpx.httpx_handler import HTTPHandler
 from litellm.proxy._types import (
@@ -1451,7 +1451,7 @@ class JWTAuthManager:
                     key=user_object.user_id,
                     value=user_object,
                     model_type=LiteLLM_UserTable,
-                    ttl=DEFAULT_MANAGEMENT_OBJECT_IN_MEMORY_CACHE_TTL,
+                    ttl=_management_object_cache_ttl(user_api_key_cache),
                 )
 
         # Sync team memberships
@@ -1475,7 +1475,7 @@ class JWTAuthManager:
                     key=user_object.user_id,
                     value=user_object,
                     model_type=LiteLLM_UserTable,
-                    ttl=DEFAULT_MANAGEMENT_OBJECT_IN_MEMORY_CACHE_TTL,
+                    ttl=_management_object_cache_ttl(user_api_key_cache),
                 )
         return None
 
