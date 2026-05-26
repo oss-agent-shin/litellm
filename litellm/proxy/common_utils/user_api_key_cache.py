@@ -132,9 +132,54 @@ class UserApiKeyCache(DualCache):
             return None
         return decoded
 
+    def _honor_user_api_key_cache_ttl(self, kwargs: dict) -> None:
+        """
+        Bridge ``general_settings.user_api_key_cache_ttl`` (LIT-3338) through to writes.
+
+        Every management-object cache write in ``litellm/proxy/auth/auth_checks.py``
+        explicitly passes ``ttl=DEFAULT_MANAGEMENT_OBJECT_IN_MEMORY_CACHE_TTL`` on
+        ``async_set_cache``. ``DualCache.async_set_cache`` then uses that explicit
+        kwarg verbatim, overriding ``self.default_in_memory_ttl`` -- the value
+        that ``proxy_server.load_config`` seeds from
+        ``general_settings.user_api_key_cache_ttl`` via
+        ``DualCache.update_cache_ttl``. The net effect: the configured TTL is
+        ignored and every API-key auth cache entry is pinned to 60s.
+
+        To honor the operator's configuration without touching every call site,
+        detect the management-object sentinel value and swap it for the
+        configured ``default_in_memory_ttl`` when the two differ. Explicit ttls
+        that are NOT the management-object sentinel are passed through unchanged,
+        so callers that intentionally pick a different TTL keep their value.
+        """
+        ttl = kwargs.get("ttl")
+        if ttl is None:
+            return
+        cache_default = getattr(self, "default_in_memory_ttl", None)
+        if cache_default is None:
+            return
+        try:
+            from litellm.constants import (
+                DEFAULT_MANAGEMENT_OBJECT_IN_MEMORY_CACHE_TTL,
+            )
+        except ImportError:
+            return
+        try:
+            ttl_f = float(ttl)
+            sentinel = float(DEFAULT_MANAGEMENT_OBJECT_IN_MEMORY_CACHE_TTL)
+            cache_default_f = float(cache_default)
+        except (TypeError, ValueError):
+            return
+        # Only swap when the caller passed exactly the management-object
+        # default AND the operator-configured default genuinely differs --
+        # otherwise we'd be a no-op (or worse, change semantics for callers
+        # that happen to pass the same numeric value coincidentally).
+        if ttl_f == sentinel and cache_default_f != sentinel:
+            kwargs["ttl"] = cache_default
+
     def set_cache(self, key, value, local_only: bool = False, **kwargs):  # type: ignore[override]
         model_type = cast(Optional[Type[BaseModel]], kwargs.pop("model_type", None))
         payload = CacheCodec.serialize(value, model_type=model_type)
+        self._honor_user_api_key_cache_ttl(kwargs)
         return super().set_cache(
             key=key, value=payload, local_only=local_only, **kwargs
         )
@@ -142,6 +187,7 @@ class UserApiKeyCache(DualCache):
     async def async_set_cache(self, key, value, local_only: bool = False, **kwargs):  # type: ignore[override]
         model_type = cast(Optional[Type[BaseModel]], kwargs.pop("model_type", None))
         payload = CacheCodec.serialize(value, model_type=model_type)
+        self._honor_user_api_key_cache_ttl(kwargs)
         return await super().async_set_cache(
             key=key, value=payload, local_only=local_only, **kwargs
         )
