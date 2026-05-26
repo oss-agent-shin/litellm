@@ -695,3 +695,250 @@ async def test_organization_member_delete_rejects_unauthorized_caller(
             user_api_key_dict=unauthorized_caller,
         )
     assert exc.value.status_code == 403
+
+
+# -----------------------------------------------------------------------------
+# Regression tests for LIT-3284 / issue #27640:
+#   internal users should also see orgs that own teams they belong to, even
+#   when they are not an explicit organization member. Without this, the
+#   admin UI's Org column on the API keys page falls back to rendering the
+#   bare org UUID because /organization/list returns no orgs the user can
+#   resolve.
+# -----------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_get_visible_org_ids_includes_team_derived_orgs(monkeypatch):
+    """An internal user with no direct org membership but in a team that
+    belongs to an org should still see that org in the visibility set."""
+    from litellm.proxy.management_endpoints.organization_endpoints import (
+        _get_visible_org_ids_for_internal_user,
+    )
+
+    prisma_client = MagicMock()
+    prisma_client.db.litellm_organizationmembership.find_many = AsyncMock(
+        return_value=[]  # no direct org memberships
+    )
+
+    user_row = MagicMock()
+    user_row.teams = ["team-a", "team-b"]
+    prisma_client.db.litellm_usertable.find_unique = AsyncMock(return_value=user_row)
+
+    team_a = MagicMock()
+    team_a.organization_id = "org-1"
+    team_b = MagicMock()
+    team_b.organization_id = None  # team not in any org — should be skipped
+    prisma_client.db.litellm_teamtable.find_many = AsyncMock(
+        return_value=[team_a, team_b]
+    )
+
+    visible = await _get_visible_org_ids_for_internal_user(
+        prisma_client=prisma_client, user_id="bd-user"
+    )
+    assert visible == ["org-1"]
+
+
+@pytest.mark.asyncio
+async def test_get_visible_org_ids_dedupes_membership_and_team_overlap(monkeypatch):
+    """When a user is both an explicit org member AND in a team in that same
+    org, the org should appear exactly once with membership ordering first."""
+    from litellm.proxy.management_endpoints.organization_endpoints import (
+        _get_visible_org_ids_for_internal_user,
+    )
+
+    prisma_client = MagicMock()
+
+    membership = MagicMock()
+    membership.organization_id = "org-shared"
+    membership_other = MagicMock()
+    membership_other.organization_id = "org-direct-only"
+    prisma_client.db.litellm_organizationmembership.find_many = AsyncMock(
+        return_value=[membership, membership_other]
+    )
+
+    user_row = MagicMock()
+    user_row.teams = ["team-1", "team-2"]
+    prisma_client.db.litellm_usertable.find_unique = AsyncMock(return_value=user_row)
+
+    team_1 = MagicMock()
+    team_1.organization_id = "org-shared"  # overlap with direct membership
+    team_2 = MagicMock()
+    team_2.organization_id = "org-team-only"
+    prisma_client.db.litellm_teamtable.find_many = AsyncMock(
+        return_value=[team_1, team_2]
+    )
+
+    visible = await _get_visible_org_ids_for_internal_user(
+        prisma_client=prisma_client, user_id="user-1"
+    )
+    # membership-derived first, team-derived appended, no duplicates
+    assert visible == ["org-shared", "org-direct-only", "org-team-only"]
+
+
+@pytest.mark.asyncio
+async def test_get_visible_org_ids_returns_empty_when_no_user_id():
+    from litellm.proxy.management_endpoints.organization_endpoints import (
+        _get_visible_org_ids_for_internal_user,
+    )
+
+    prisma_client = MagicMock()
+    visible = await _get_visible_org_ids_for_internal_user(
+        prisma_client=prisma_client, user_id=None
+    )
+    assert visible == []
+
+
+@pytest.mark.asyncio
+async def test_get_visible_org_ids_handles_user_with_no_teams():
+    """User with direct membership but no teams returns just the membership orgs."""
+    from litellm.proxy.management_endpoints.organization_endpoints import (
+        _get_visible_org_ids_for_internal_user,
+    )
+
+    prisma_client = MagicMock()
+    membership = MagicMock()
+    membership.organization_id = "org-1"
+    prisma_client.db.litellm_organizationmembership.find_many = AsyncMock(
+        return_value=[membership]
+    )
+
+    user_row = MagicMock()
+    user_row.teams = []
+    prisma_client.db.litellm_usertable.find_unique = AsyncMock(return_value=user_row)
+    prisma_client.db.litellm_teamtable.find_many = AsyncMock(return_value=[])
+
+    visible = await _get_visible_org_ids_for_internal_user(
+        prisma_client=prisma_client, user_id="user-1"
+    )
+    assert visible == ["org-1"]
+    # team lookup should be skipped — only the membership query was needed
+    prisma_client.db.litellm_teamtable.find_many.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_list_organization_returns_team_org_for_internal_user(monkeypatch):
+    """End-to-end: the /organization/list route returns the team-derived org
+    for an internal user with no direct org membership."""
+    from litellm.proxy._types import LitellmUserRoles
+    from litellm.proxy.management_endpoints import organization_endpoints
+    from litellm.proxy.management_endpoints.organization_endpoints import (
+        list_organization,
+    )
+
+    mock_prisma = MagicMock()
+    mock_prisma.db.litellm_organizationmembership.find_many = AsyncMock(
+        return_value=[]
+    )
+    user_row = MagicMock()
+    user_row.teams = ["team-a"]
+    mock_prisma.db.litellm_usertable.find_unique = AsyncMock(return_value=user_row)
+    team_a = MagicMock()
+    team_a.organization_id = "blackduck-org"
+    mock_prisma.db.litellm_teamtable.find_many = AsyncMock(return_value=[team_a])
+
+    blackduck_org_row = MagicMock()
+    blackduck_org_row.organization_id = "blackduck-org"
+    blackduck_org_row.organization_alias = "BlackDuck"
+    mock_prisma.db.litellm_organizationtable.find_many = AsyncMock(
+        return_value=[blackduck_org_row]
+    )
+
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", mock_prisma)
+    monkeypatch.setattr(
+        organization_endpoints,
+        "_user_has_admin_view",
+        lambda _user_api_key_dict: False,
+    )
+
+    user_api_key_dict = MagicMock()
+    user_api_key_dict.user_id = "bd-user"
+    user_api_key_dict.user_role = LitellmUserRoles.INTERNAL_USER
+
+    result = await list_organization(
+        org_id=None,
+        org_alias=None,
+        user_api_key_dict=user_api_key_dict,
+    )
+
+    assert result == [blackduck_org_row]
+    # And the filter passed to prisma must use the team-derived org_id list.
+    call_kwargs = mock_prisma.db.litellm_organizationtable.find_many.call_args.kwargs
+    assert call_kwargs["where"]["organization_id"] == {"in": ["blackduck-org"]}
+
+
+@pytest.mark.asyncio
+async def test_list_organization_empty_for_user_with_no_visibility(monkeypatch):
+    """Internal user with no org membership and no team-in-org -> empty list."""
+    from litellm.proxy._types import LitellmUserRoles
+    from litellm.proxy.management_endpoints import organization_endpoints
+    from litellm.proxy.management_endpoints.organization_endpoints import (
+        list_organization,
+    )
+
+    mock_prisma = MagicMock()
+    mock_prisma.db.litellm_organizationmembership.find_many = AsyncMock(
+        return_value=[]
+    )
+    user_row = MagicMock()
+    user_row.teams = []
+    mock_prisma.db.litellm_usertable.find_unique = AsyncMock(return_value=user_row)
+    mock_prisma.db.litellm_organizationtable.find_many = AsyncMock(return_value=[])
+
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", mock_prisma)
+    monkeypatch.setattr(
+        organization_endpoints,
+        "_user_has_admin_view",
+        lambda _user_api_key_dict: False,
+    )
+
+    user_api_key_dict = MagicMock()
+    user_api_key_dict.user_id = "lone-user"
+    user_api_key_dict.user_role = LitellmUserRoles.INTERNAL_USER
+
+    result = await list_organization(
+        org_id=None,
+        org_alias=None,
+        user_api_key_dict=user_api_key_dict,
+    )
+    assert result == []
+    # When there's no visibility, we must not even query the org table.
+    mock_prisma.db.litellm_organizationtable.find_many.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_list_organization_filters_org_id_against_visibility(monkeypatch):
+    """If the caller asks for a specific org_id they cannot see, return []."""
+    from litellm.proxy._types import LitellmUserRoles
+    from litellm.proxy.management_endpoints import organization_endpoints
+    from litellm.proxy.management_endpoints.organization_endpoints import (
+        list_organization,
+    )
+
+    mock_prisma = MagicMock()
+    membership = MagicMock()
+    membership.organization_id = "org-visible"
+    mock_prisma.db.litellm_organizationmembership.find_many = AsyncMock(
+        return_value=[membership]
+    )
+    user_row = MagicMock()
+    user_row.teams = []
+    mock_prisma.db.litellm_usertable.find_unique = AsyncMock(return_value=user_row)
+    mock_prisma.db.litellm_organizationtable.find_many = AsyncMock(return_value=[])
+
+    monkeypatch.setattr("litellm.proxy.proxy_server.prisma_client", mock_prisma)
+    monkeypatch.setattr(
+        organization_endpoints,
+        "_user_has_admin_view",
+        lambda _user_api_key_dict: False,
+    )
+
+    user_api_key_dict = MagicMock()
+    user_api_key_dict.user_id = "user-1"
+    user_api_key_dict.user_role = LitellmUserRoles.INTERNAL_USER
+
+    result = await list_organization(
+        org_id="org-i-cannot-see",
+        org_alias=None,
+        user_api_key_dict=user_api_key_dict,
+    )
+    assert result == []
+    mock_prisma.db.litellm_organizationtable.find_many.assert_not_called()
