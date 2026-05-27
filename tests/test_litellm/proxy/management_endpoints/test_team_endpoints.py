@@ -7333,7 +7333,7 @@ async def test_list_team_v1_batches_key_queries():
         patch(
             "litellm.proxy.management_endpoints.team_endpoints._authorize_and_filter_teams",
             new_callable=AsyncMock,
-            return_value=[team1, team2],
+            return_value=([team1, team2], False),
         ),
         patch(
             "litellm.proxy.management_endpoints.team_endpoints.get_all_team_memberships",
@@ -8108,3 +8108,345 @@ async def test_update_team_blocks_non_admin_passthrough_routes(mock_db_client):
             )
     assert str(exc.value.code) == "403"
     assert "allowed_passthrough_routes" in str(exc.value.message)
+
+
+@pytest.mark.asyncio
+async def test_authorize_and_filter_teams_returns_narrow_flag_for_internal_user_own_query():
+    """
+    LIT-2553: For an internal_user querying their own user_id, the auth
+    function returns (teams, True) so list_team narrows the response.
+    """
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from litellm.proxy._types import (
+        LiteLLM_TeamTable,
+        LiteLLM_UserTable,
+        LitellmUserRoles,
+        UserAPIKeyAuth,
+    )
+    from litellm.proxy.management_endpoints.team_endpoints import (
+        _authorize_and_filter_teams,
+    )
+
+    caller = UserAPIKeyAuth(
+        user_role=LitellmUserRoles.INTERNAL_USER,
+        user_id="alice",
+    )
+    team_a = LiteLLM_TeamTable(
+        team_id="team-A",
+        members_with_roles=[Member(role="user", user_id="alice")],
+    )
+    team_b = LiteLLM_TeamTable(
+        team_id="team-B",
+        members_with_roles=[Member(role="user", user_id="alice")],
+    )
+
+    mock_prisma_client = MagicMock()
+    mock_prisma_client.db.litellm_teamtable.find_many = AsyncMock(
+        return_value=[team_a, team_b]
+    )
+
+    with patch(
+        "litellm.proxy.management_endpoints.team_endpoints.get_user_object",
+        new_callable=AsyncMock,
+        return_value=LiteLLM_UserTable(
+            user_id="alice", organization_memberships=[]
+        ),
+    ):
+        teams, narrow = await _authorize_and_filter_teams(
+            user_api_key_dict=caller,
+            user_id="alice",
+            prisma_client=mock_prisma_client,
+            user_api_key_cache=MagicMock(),
+            proxy_logging_obj=MagicMock(),
+        )
+
+    assert narrow is True
+    assert [t.team_id for t in teams] == ["team-A", "team-B"]
+
+
+@pytest.mark.asyncio
+async def test_authorize_and_filter_teams_returns_no_narrow_for_proxy_admin():
+    """
+    LIT-2553: Proxy admins see the unfiltered response; narrow flag is False.
+    """
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from litellm.proxy._types import (
+        LiteLLM_TeamTable,
+        LitellmUserRoles,
+        UserAPIKeyAuth,
+    )
+    from litellm.proxy.management_endpoints.team_endpoints import (
+        _authorize_and_filter_teams,
+    )
+
+    caller = UserAPIKeyAuth(
+        user_role=LitellmUserRoles.PROXY_ADMIN, user_id="admin"
+    )
+    team_a = LiteLLM_TeamTable(team_id="team-A")
+
+    mock_prisma_client = MagicMock()
+    mock_prisma_client.db.litellm_teamtable.find_many = AsyncMock(
+        return_value=[team_a]
+    )
+
+    teams, narrow = await _authorize_and_filter_teams(
+        user_api_key_dict=caller,
+        user_id=None,
+        prisma_client=mock_prisma_client,
+        user_api_key_cache=MagicMock(),
+        proxy_logging_obj=MagicMock(),
+    )
+
+    assert narrow is False
+    assert [t.team_id for t in teams] == ["team-A"]
+
+
+@pytest.mark.asyncio
+async def test_authorize_and_filter_teams_returns_no_narrow_for_org_admin():
+    """
+    LIT-2553: Org admins (non-proxy-admins with allowed_org_ids) see
+    unfiltered team data for teams in their orgs; narrow flag is False.
+    """
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from litellm.proxy._types import (
+        LiteLLM_OrganizationMembershipTable,
+        LiteLLM_TeamTable,
+        LiteLLM_UserTable,
+        LitellmUserRoles,
+        UserAPIKeyAuth,
+    )
+    from litellm.proxy.management_endpoints.team_endpoints import (
+        _authorize_and_filter_teams,
+    )
+
+    caller = UserAPIKeyAuth(
+        user_role=LitellmUserRoles.INTERNAL_USER, user_id="orgadmin"
+    )
+    team_a = LiteLLM_TeamTable(team_id="team-A", organization_id="org-1")
+    mock_prisma_client = MagicMock()
+    mock_prisma_client.db.litellm_teamtable.find_many = AsyncMock(
+        return_value=[team_a]
+    )
+
+    org_membership = LiteLLM_OrganizationMembershipTable(
+        user_id="orgadmin",
+        organization_id="org-1",
+        user_role=LitellmUserRoles.ORG_ADMIN.value,
+    )
+    with patch(
+        "litellm.proxy.management_endpoints.team_endpoints.get_user_object",
+        new_callable=AsyncMock,
+        return_value=LiteLLM_UserTable(
+            user_id="orgadmin", organization_memberships=[org_membership]
+        ),
+    ):
+        teams, narrow = await _authorize_and_filter_teams(
+            user_api_key_dict=caller,
+            user_id=None,
+            prisma_client=mock_prisma_client,
+            user_api_key_cache=MagicMock(),
+            proxy_logging_obj=MagicMock(),
+        )
+
+    assert narrow is False
+    assert [t.team_id for t in teams] == ["team-A"]
+
+
+def test_narrow_team_response_filters_keys_memberships_and_members():
+    """
+    LIT-2553: _narrow_team_response_for_internal_user removes
+    keys / team_memberships / members_with_roles that don't belong to the
+    caller, while preserving team-level fields.
+    """
+    from unittest.mock import MagicMock
+
+    from litellm.proxy._types import (
+        LiteLLM_BudgetTable,
+        LiteLLM_TeamMembership,
+        Member,
+        TeamListResponseObject,
+    )
+    from litellm.proxy.management_endpoints.team_endpoints import (
+        _narrow_team_response_for_internal_user,
+    )
+
+    own_key = MagicMock()
+    own_key.user_id = "alice"
+    other_key = MagicMock()
+    other_key.user_id = "bob"
+
+    own_membership = LiteLLM_TeamMembership(
+        user_id="alice",
+        team_id="team-1",
+        litellm_budget_table=LiteLLM_BudgetTable(),
+    )
+    other_membership = LiteLLM_TeamMembership(
+        user_id="bob",
+        team_id="team-1",
+        litellm_budget_table=LiteLLM_BudgetTable(),
+    )
+
+    response = TeamListResponseObject(
+        team_id="team-1",
+        team_alias="Shared Team",
+        models=["gpt-4o"],
+        max_budget=100.0,
+        members_with_roles=[
+            Member(role="admin", user_id="alice"),
+            Member(role="user", user_id="bob"),
+            Member(role="user", user_id="carol"),
+        ],
+        team_memberships=[own_membership, other_membership],
+        keys=[own_key, other_key],
+    )
+
+    narrowed = _narrow_team_response_for_internal_user(response, "alice")
+
+    # Caller-scoped fields filtered
+    assert narrowed.keys == [own_key]
+    assert narrowed.team_memberships == [own_membership]
+    assert [m.user_id for m in narrowed.members_with_roles] == ["alice"]
+
+    # Team-level fields preserved
+    assert narrowed.team_id == "team-1"
+    assert narrowed.team_alias == "Shared Team"
+    assert narrowed.models == ["gpt-4o"]
+    assert narrowed.max_budget == 100.0
+
+
+def test_narrow_team_response_handles_empty_lists():
+    """
+    LIT-2553: _narrow_team_response_for_internal_user tolerates empty / None
+    list fields so it can run on every team response shape from the DB.
+    """
+    from litellm.proxy._types import TeamListResponseObject
+    from litellm.proxy.management_endpoints.team_endpoints import (
+        _narrow_team_response_for_internal_user,
+    )
+
+    response = TeamListResponseObject(
+        team_id="team-empty",
+        members_with_roles=[],
+        team_memberships=[],
+        keys=[],
+    )
+    narrowed = _narrow_team_response_for_internal_user(response, "alice")
+    assert narrowed.keys == []
+    assert narrowed.team_memberships == []
+    assert narrowed.members_with_roles == []
+
+
+@pytest.mark.asyncio
+async def test_list_team_narrows_response_for_internal_user_own_query():
+    """
+    LIT-2553 — end-to-end: an internal_user calling /team/list?user_id=<self>
+    receives a narrowed response (only their own keys / memberships / member
+    entry), while a proxy_admin calling the same endpoint sees the full
+    payload.
+    """
+    from unittest.mock import AsyncMock, MagicMock, Mock, patch
+
+    from fastapi import Request
+
+    from litellm.proxy._types import (
+        LiteLLM_BudgetTable,
+        LiteLLM_TeamMembership,
+        LiteLLM_TeamTable,
+        LitellmUserRoles,
+        Member,
+        UserAPIKeyAuth,
+    )
+    from litellm.proxy.management_endpoints.team_endpoints import list_team
+
+    mock_request = Mock(spec=Request)
+
+    team = LiteLLM_TeamTable(
+        team_id="team-1",
+        team_alias="Shared Team",
+        members_with_roles=[
+            Member(role="admin", user_id="alice"),
+            Member(role="user", user_id="bob"),
+        ],
+    )
+
+    own_key = MagicMock()
+    own_key.team_id = "team-1"
+    own_key.user_id = "alice"
+    other_key = MagicMock()
+    other_key.team_id = "team-1"
+    other_key.user_id = "bob"
+
+    own_membership = LiteLLM_TeamMembership(
+        user_id="alice",
+        team_id="team-1",
+        litellm_budget_table=LiteLLM_BudgetTable(),
+    )
+    other_membership = LiteLLM_TeamMembership(
+        user_id="bob",
+        team_id="team-1",
+        litellm_budget_table=LiteLLM_BudgetTable(),
+    )
+
+    # --- internal_user querying their own teams ---
+    internal_caller = UserAPIKeyAuth(
+        user_role=LitellmUserRoles.INTERNAL_USER, user_id="alice"
+    )
+    with (
+        patch("litellm.proxy.proxy_server.prisma_client") as mock_prisma,
+        patch(
+            "litellm.proxy.management_endpoints.team_endpoints._authorize_and_filter_teams",
+            new_callable=AsyncMock,
+            return_value=([team], True),
+        ),
+        patch(
+            "litellm.proxy.management_endpoints.team_endpoints.get_all_team_memberships",
+            new_callable=AsyncMock,
+            return_value=[own_membership, other_membership],
+        ),
+    ):
+        mock_prisma.db.litellm_verificationtoken.find_many = AsyncMock(
+            return_value=[own_key, other_key]
+        )
+        internal_result = await list_team(
+            http_request=mock_request,
+            user_id="alice",
+            user_api_key_dict=internal_caller,
+        )
+    assert len(internal_result) == 1
+    assert internal_result[0].keys == [own_key]
+    assert internal_result[0].team_memberships == [own_membership]
+    assert [m.user_id for m in internal_result[0].members_with_roles] == ["alice"]
+
+    # --- proxy_admin sees the full response ---
+    admin_caller = UserAPIKeyAuth(
+        user_role=LitellmUserRoles.PROXY_ADMIN, user_id="root"
+    )
+    with (
+        patch("litellm.proxy.proxy_server.prisma_client") as mock_prisma,
+        patch(
+            "litellm.proxy.management_endpoints.team_endpoints._authorize_and_filter_teams",
+            new_callable=AsyncMock,
+            return_value=([team], False),
+        ),
+        patch(
+            "litellm.proxy.management_endpoints.team_endpoints.get_all_team_memberships",
+            new_callable=AsyncMock,
+            return_value=[own_membership, other_membership],
+        ),
+    ):
+        mock_prisma.db.litellm_verificationtoken.find_many = AsyncMock(
+            return_value=[own_key, other_key]
+        )
+        admin_result = await list_team(
+            http_request=mock_request,
+            user_api_key_dict=admin_caller,
+        )
+    assert admin_result[0].keys == [own_key, other_key]
+    assert admin_result[0].team_memberships == [own_membership, other_membership]
+    assert sorted(m.user_id for m in admin_result[0].members_with_roles) == [
+        "alice",
+        "bob",
+    ]
