@@ -988,14 +988,24 @@ class LiteLLMCompletionResponsesConfig:
             # Since guardrails skip None content anyway, we return empty list to exclude it from structured messages
             if content is None:
                 return []
-            return [
-                GenericChatCompletionMessage(
-                    role=input_item.get("role") or "user",
-                    content=LiteLLMCompletionResponsesConfig._transform_responses_api_content_to_chat_completion_content(
-                        content
-                    ),
-                )
-            ]
+            chat_message: GenericChatCompletionMessage = GenericChatCompletionMessage(
+                role=input_item.get("role") or "user",
+                content=LiteLLMCompletionResponsesConfig._transform_responses_api_content_to_chat_completion_content(
+                    content
+                ),
+            )
+            # Preserve a top-level cache_control on the Responses-API input item so it
+            # survives into anthropic_messages_pt. AnthropicCacheControlHook places
+            # cache_control here when the message content is a plain string (see
+            # litellm/integrations/anthropic_cache_control_hook.py::_safe_insert_cache_control_in_message),
+            # and the downstream Anthropic transform already reads top-level cache_control
+            # for system / user / assistant string-content messages.
+            # Without this, cache_control_injection_points is silently lost on /responses.
+            if isinstance(input_item, dict):
+                cache_control = input_item.get("cache_control")
+                if cache_control is not None:
+                    chat_message["cache_control"] = cache_control  # type: ignore[typeddict-unknown-key]
+            return [chat_message]
 
     @staticmethod
     def _is_input_item_tool_call_output(input_item: Any) -> bool:
