@@ -476,4 +476,71 @@ describe("CreateUserButton", () => {
       expect(within(dialog).getByRole("checkbox", { name: /send invitation email/i })).toBeChecked();
     });
   });
+
+  describe("LIT-3149: default user_role on invite", () => {
+    it("should default user_role to internal_user when submitting embedded form without changing role", async () => {
+      const user = userEvent.setup();
+      mockUserCreateCall.mockResolvedValue({ data: { user_id: "lit3149-emb" } });
+      mockInvitationCreateCall.mockResolvedValue({
+        id: "inv-lit3149-emb",
+        user_id: "lit3149-emb",
+        has_user_setup_sso: false,
+      } as any);
+
+      renderWithProviders(
+        <CreateUserButton {...defaultProps} possibleUIRoles={{ proxy_user: { ui_label: "User", description: "" } }} isEmbedded />,
+      );
+
+      await user.type(screen.getByLabelText(/user email/i), "default-role@example.com");
+      // Intentionally do NOT touch the role combobox - assert the form initialValue.
+      await user.click(screen.getByRole("button", { name: /create user/i }));
+
+      await waitFor(() => {
+        expect(mockUserCreateCall).toHaveBeenCalledWith(
+          "token",
+          null,
+          expect.objectContaining({
+            user_email: "default-role@example.com",
+            user_role: "internal_user",
+          }),
+        );
+      });
+    });
+
+    it("should default user_role to internal_user when submitting standalone invite modal without changing role", async () => {
+      const user = userEvent.setup();
+      mockUserCreateCall.mockResolvedValue({ data: { user_id: "lit3149-std" } });
+      mockInvitationCreateCall.mockResolvedValue({
+        id: "inv-lit3149-std",
+        user_id: "lit3149-std",
+        has_user_setup_sso: false,
+      } as any);
+
+      renderWithProviders(
+        <CreateUserButton {...defaultProps} possibleUIRoles={{ proxy_user: { ui_label: "User", description: "" } }} />,
+      );
+
+      await waitFor(() => {
+        expect(screen.getByRole("button", { name: /\+ invite user/i })).toBeInTheDocument();
+      });
+      await user.click(screen.getByRole("button", { name: /\+ invite user/i }));
+
+      const dialog = screen.getByRole("dialog", { name: /invite user/i });
+      await user.type(within(dialog).getByLabelText(/user email/i), "default-role-std@example.com");
+      // Intentionally do NOT touch the Global Proxy Role combobox - assert the form initialValue.
+      await user.click(within(dialog).getByRole("button", { name: /invite user/i }));
+
+      await waitFor(() => {
+        expect(mockUserCreateCall).toHaveBeenCalledWith(
+          "token",
+          null,
+          expect.objectContaining({
+            user_email: "default-role-std@example.com",
+            user_role: "internal_user",
+          }),
+        );
+      });
+    });
+  });
+
 });
