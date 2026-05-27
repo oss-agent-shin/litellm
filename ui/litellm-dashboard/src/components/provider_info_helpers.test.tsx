@@ -218,14 +218,20 @@ describe("provider_info_helpers", () => {
       expect(result).toEqual(["gpt-3.5-turbo", "gpt-4"]);
     });
 
-    it("should return models when litellm_provider includes the provider string", () => {
+    it("should match legitimate provider variants (separator-anchored prefix)", () => {
+      // anthropic_text is a real provider variant in
+      // model_prices_and_context_window.json and should still match Anthropic.
+      // "vertex_ai-anthropic_models" must NOT leak in - separator-anchored
+      // prefix matching keeps the variant but blocks the substring leak.
       const modelMap = {
-        "custom-openai-model": { litellm_provider: "custom_openai_endpoint" },
-        "another-model": { litellm_provider: "openai" },
+        "anthropic-text-model": { litellm_provider: "anthropic_text" },
+        "claude-3-opus": { litellm_provider: "anthropic" },
+        "vertex_ai/claude-sonnet-4-5": { litellm_provider: "vertex_ai-anthropic_models" },
       };
-      const result = getProviderModels(Providers.OpenAI, modelMap);
-      expect(result).toContain("custom-openai-model");
-      expect(result).toContain("another-model");
+      const result = getProviderModels(Providers.Anthropic, modelMap);
+      expect(result).toContain("claude-3-opus");
+      expect(result).toContain("anthropic-text-model");
+      expect(result).not.toContain("vertex_ai/claude-sonnet-4-5");
     });
 
     it("should filter out models with null values", () => {
@@ -310,6 +316,104 @@ describe("provider_info_helpers", () => {
       expect(openaiResult).toEqual(["gpt-3.5-turbo"]);
       expect(anthropicResult).toEqual(["claude-3-opus"]);
       expect(groqResult).toContain("groq-model");
+    });
+
+    // ----- LIT-3311 regression: substring match across providers -----
+
+    it("should NOT leak vertex_ai-anthropic_models into the Anthropic dropdown (LIT-3311)", () => {
+      const modelMap = {
+        "claude-3-opus": { litellm_provider: "anthropic" },
+        "vertex_ai/claude-sonnet-4-5": { litellm_provider: "vertex_ai-anthropic_models" },
+        "vertex_ai/claude-opus-4-1": { litellm_provider: "vertex_ai-anthropic_models" },
+      };
+      const result = getProviderModels(Providers.Anthropic, modelMap);
+      expect(result).toEqual(["claude-3-opus"]);
+    });
+
+    it("should NOT leak vertex_ai-openai_models into the OpenAI dropdown (LIT-3311)", () => {
+      const modelMap = {
+        "gpt-4": { litellm_provider: "openai" },
+        "vertex_ai/gpt-oss": { litellm_provider: "vertex_ai-openai_models" },
+      };
+      const result = getProviderModels(Providers.OpenAI, modelMap);
+      expect(result).toContain("gpt-4");
+      expect(result).not.toContain("vertex_ai/gpt-oss");
+    });
+
+    it("should NOT leak vertex_ai-mistral_models into the MistralAI dropdown (LIT-3311)", () => {
+      const modelMap = {
+        "mistral-large": { litellm_provider: "mistral" },
+        "vertex_ai/mistral-7b": { litellm_provider: "vertex_ai-mistral_models" },
+      };
+      const result = getProviderModels(Providers.MistralAI, modelMap);
+      expect(result).toContain("mistral-large");
+      expect(result).not.toContain("vertex_ai/mistral-7b");
+    });
+
+    it("should NOT leak vertex_ai-deepseek_models into the Deepseek dropdown (LIT-3311)", () => {
+      const modelMap = {
+        "deepseek-chat": { litellm_provider: "deepseek" },
+        "vertex_ai/deepseek": { litellm_provider: "vertex_ai-deepseek_models" },
+      };
+      const result = getProviderModels(Providers.Deepseek, modelMap);
+      expect(result).toContain("deepseek-chat");
+      expect(result).not.toContain("vertex_ai/deepseek");
+    });
+
+    it("should NOT leak vertex_ai-moonshot_models into the Moonshot dropdown (LIT-3311)", () => {
+      const modelMap = {
+        "moonshot-v1": { litellm_provider: "moonshot" },
+        "vertex_ai/moonshot": { litellm_provider: "vertex_ai-moonshot_models" },
+      };
+      const result = getProviderModels(Providers.MOONSHOT, modelMap);
+      expect(result).toContain("moonshot-v1");
+      expect(result).not.toContain("vertex_ai/moonshot");
+    });
+
+    it("should NOT leak vertex_ai-minimax_models into the MiniMax dropdown (LIT-3311)", () => {
+      const modelMap = {
+        "minimax-chat": { litellm_provider: "minimax" },
+        "vertex_ai/minimax": { litellm_provider: "vertex_ai-minimax_models" },
+      };
+      const result = getProviderModels(Providers.MiniMax, modelMap);
+      expect(result).toContain("minimax-chat");
+      expect(result).not.toContain("vertex_ai/minimax");
+    });
+
+    it("should keep bedrock_converse + bedrock_mantle in the Bedrock dropdown (variant preservation)", () => {
+      const modelMap = {
+        "anthropic.claude-3": { litellm_provider: "bedrock" },
+        "bedrock/anthropic.claude-3.5": { litellm_provider: "bedrock_converse" },
+        "mantle-model": { litellm_provider: "bedrock_mantle" },
+        "vertex_ai/claude-sonnet": { litellm_provider: "vertex_ai-anthropic_models" },
+      };
+      const result = getProviderModels(Providers.Bedrock, modelMap);
+      expect(result).toContain("anthropic.claude-3");
+      expect(result).toContain("bedrock/anthropic.claude-3.5");
+      expect(result).toContain("mantle-model");
+      expect(result).not.toContain("vertex_ai/claude-sonnet");
+    });
+
+    it("should keep azure_text + azure_ai variants in the Azure dropdown (variant preservation)", () => {
+      const modelMap = {
+        "azure/gpt-4": { litellm_provider: "azure" },
+        "azure/text-davinci": { litellm_provider: "azure_text" },
+        "azure-ai-model": { litellm_provider: "azure_ai" },
+      };
+      const result = getProviderModels(Providers.Azure, modelMap);
+      expect(result).toContain("azure/gpt-4");
+      expect(result).toContain("azure/text-davinci");
+      expect(result).toContain("azure-ai-model");
+    });
+
+    it("should keep fireworks_ai-embedding-models in the FireworksAI dropdown (variant preservation)", () => {
+      const modelMap = {
+        "fw/llama": { litellm_provider: "fireworks_ai" },
+        "fw/nomic-embed": { litellm_provider: "fireworks_ai-embedding-models" },
+      };
+      const result = getProviderModels(Providers.FireworksAI, modelMap);
+      expect(result).toContain("fw/llama");
+      expect(result).toContain("fw/nomic-embed");
     });
   });
 });
