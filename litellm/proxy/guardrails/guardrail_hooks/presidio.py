@@ -1392,25 +1392,37 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
     def _split_at_safe_boundary(
         self, text: str, holdback: int
     ) -> Tuple[str, str]:
-        """Split text so as much as possible is safe to flush now.
+        """Split `text` into (flush_head, hold_tail).
 
-        Keep at least `holdback` chars in the tail. Within a small search
-        window, prefer to cut at a whitespace/punctuation boundary so PII
-        entities (emails, phones) are not split mid-token.
+        Walk from the end of the buffer looking for a token boundary
+        (whitespace, punctuation, end-of-sentence). Everything up to and
+        including the last boundary is safe to flush; everything after is
+        held back so PII entities spanning chunk boundaries (an email split
+        across two upstream SSE chunks) still appears intact when we call
+        the analyzer.
+
+        `holdback` is treated as a soft upper bound for the held tail: if the
+        tail grows beyond `holdback` characters without finding any
+        boundary, we force a cut at `len(text) - holdback` so we never grow
+        the buffer without bound. Tiny heads (< 3 chars) are also held back
+        to avoid pathological 1-character flushes that defeat batching.
         """
-        if len(text) <= holdback:
-            return "", text
-        cut = len(text) - holdback
-        safe_window = max(1, holdback // 2)
+        if not text:
+            return "", ""
         boundary_chars = " \n\t.,;:!?\"\')(\u2014\u2013-"
         best = -1
-        for k in range(cut - 1, max(0, cut - safe_window) - 1, -1):
+        for k in range(len(text) - 1, -1, -1):
             if text[k] in boundary_chars:
                 best = k + 1
                 break
-        if best > 0:
+        if best >= 3:
             return text[:best], text[best:]
-        return text[:cut], text[cut:]
+        # No usable boundary yet. If buffer has exceeded holdback, force-cut
+        # so we don't accumulate forever.
+        if len(text) > holdback:
+            cut = len(text) - holdback
+            return text[:cut], text[cut:]
+        return "", text
 
     async def _mask_buffer_text(self, text: str, request_data: dict) -> str:
         """Apply the configured Presidio analyzer/anonymizer to a text buffer."""
