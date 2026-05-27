@@ -54,7 +54,7 @@ from litellm.types.proxy.guardrails.guardrail_hooks.presidio import (
     PresidioAnalyzeRequest,
     PresidioAnalyzeResponseItem,
 )
-from litellm.types.utils import GuardrailStatus, StreamingChoices
+from litellm.types.utils import Delta, GuardrailStatus, StreamingChoices
 from litellm.utils import (
     EmbeddingResponse,
     ImageResponse,
@@ -1152,7 +1152,14 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
         response: Any,
         request_data: dict,
     ) -> AsyncGenerator[Union[ModelResponseStream, bytes], None]:
-        """Apply Presidio masking to streaming output (apply_to_output=True path)."""
+        """Apply Presidio masking to streaming output (apply_to_output=True path).
+
+        Incremental flushing per LIT-3222. Text deltas are accumulated into a
+        small rolling buffer and emitted via Presidio as soon as it is safe to
+        do so; a trailing-character window is held back so PII spanning chunk
+        boundaries still gets masked. Non-text chunks (tool_calls, role,
+        finish_reason) pass through immediately to preserve TTFT.
+        """
         from litellm.llms.base_llm.base_model_iterator import (
             convert_model_response_to_streaming,
         )
@@ -1161,6 +1168,10 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
 
         all_chunks: List[ModelResponseStream] = []
         passthrough_due_to_unknown_stream_shape = False
+        text_buffers: Dict[int, str] = {}
+        text_chunk_templates: Dict[int, ModelResponseStream] = {}
+        incremental_failed = False
+
         try:
             async for chunk in response:
                 if isinstance(chunk, ModelResponseStream):
@@ -1168,24 +1179,43 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
                         yield chunk
                     else:
                         all_chunks.append(chunk)
+                        if incremental_failed:
+                            continue
+                        try:
+                            async for out_chunk in self._incremental_flush_chunk(
+                                chunk=chunk,
+                                request_data=request_data,
+                                text_buffers=text_buffers,
+                                text_chunk_templates=text_chunk_templates,
+                            ):
+                                yield out_chunk
+                        except Exception as flush_err:
+                            verbose_proxy_logger.warning(
+                                "Presidio apply_to_output: incremental flush failed (%s); "
+                                "falling back to end-of-stream masking for this response.",
+                                str(flush_err),
+                            )
+                            incremental_failed = True
+                            text_buffers.clear()
+                            text_chunk_templates.clear()
                 elif isinstance(chunk, bytes):
                     yield chunk  # type: ignore[misc]
                     continue
                 else:
                     if all_chunks:
-                        # Flush buffered chunks and switch to transparent passthrough for this stream shape.
-                        # NOTE: these buffered chunks are emitted unmasked because this
-                        # stream mixed chunk types and cannot be safely reconstructed.
                         verbose_proxy_logger.warning(
                             "Presidio apply_to_output: mixed stream detected (ModelResponseStream + unknown event). "
                             "Flushing %d buffered chunks without PII masking and switching to transparent passthrough.",
                             len(all_chunks),
                         )
+                        text_buffers.clear()
+                        text_chunk_templates.clear()
                         for buffered_chunk in all_chunks:
                             yield buffered_chunk
                         all_chunks = []
                     passthrough_due_to_unknown_stream_shape = True
                     yield chunk
+
             if passthrough_due_to_unknown_stream_shape:
                 verbose_proxy_logger.warning(
                     "Presidio apply_to_output: streaming response contained unknown event objects "
@@ -1200,21 +1230,35 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
                 )
                 return
 
+            if not incremental_failed:
+                try:
+                    async for out_chunk in self._incremental_flush_drain(
+                        request_data=request_data,
+                        text_buffers=text_buffers,
+                        text_chunk_templates=text_chunk_templates,
+                        mode="mask",
+                    ):
+                        yield out_chunk
+                    return
+                except Exception as drain_err:
+                    verbose_proxy_logger.warning(
+                        "Presidio apply_to_output: incremental drain failed (%s); "
+                        "falling back to end-of-stream masking for this response.",
+                        str(drain_err),
+                    )
+
             assembled_model_response = stream_chunk_builder(
                 chunks=all_chunks, messages=request_data.get("messages")
             )
-
             if not isinstance(assembled_model_response, ModelResponse):
                 for chunk in all_chunks:
                     yield chunk
                 return
-
             await self._process_response_for_pii(
                 response=assembled_model_response,
                 request_data=request_data,
                 mode="mask",
             )
-
             mock_response_stream = convert_model_response_to_streaming(
                 assembled_model_response
             )
@@ -1230,53 +1274,267 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
         response: Any,
         request_data: dict,
     ) -> AsyncGenerator[Union[ModelResponseStream, bytes], None]:
-        """Apply PII unmasking to streaming output (output_parse_pii=True path)."""
-        from litellm.llms.base_llm.base_model_iterator import (
-            convert_model_response_to_streaming,
-        )
-        from litellm.main import stream_chunk_builder
-        from litellm.types.utils import ModelResponse
+        """Apply PII unmasking to streaming output (output_parse_pii=True path).
 
-        remaining_chunks: List[ModelResponseStream] = []
+        Pure string substitution of ``pii_tokens`` is performed inline on each
+        chunk; unlike the masking path it does not require network calls so we
+        emit chunks as they arrive with a small trailing-character holdback to
+        cover the rare case of a placeholder split across two upstream chunks.
+        See LIT-3222.
+        """
+        metadata = (request_data.get("metadata") or {}) if request_data else {}
+        pii_tokens: Dict[str, str] = metadata.get("pii_tokens", {}) or {}
+
+        all_chunks: List[ModelResponseStream] = []
+        text_buffers: Dict[int, str] = {}
+        text_chunk_templates: Dict[int, ModelResponseStream] = {}
+
         try:
             async for chunk in response:
                 if isinstance(chunk, ModelResponseStream):
-                    remaining_chunks.append(chunk)
+                    all_chunks.append(chunk)
+                    async for out_chunk in self._incremental_unmask_chunk(
+                        chunk=chunk,
+                        pii_tokens=pii_tokens,
+                        text_buffers=text_buffers,
+                        text_chunk_templates=text_chunk_templates,
+                    ):
+                        yield out_chunk
                 elif isinstance(chunk, bytes):
                     yield chunk  # type: ignore[misc]
                     continue
 
-            if not remaining_chunks:
+            if not all_chunks:
                 return
 
-            assembled_model_response = stream_chunk_builder(
-                chunks=remaining_chunks, messages=request_data.get("messages")
-            )
-
-            if not isinstance(assembled_model_response, ModelResponse):
-                for chunk in remaining_chunks:
-                    yield chunk
-                return
-
-            self._preserve_usage_from_last_chunk(
-                assembled_model_response, remaining_chunks
-            )
-
-            await self._process_response_for_pii(
-                response=assembled_model_response,
+            async for out_chunk in self._incremental_flush_drain(
                 request_data=request_data,
+                text_buffers=text_buffers,
+                text_chunk_templates=text_chunk_templates,
                 mode="unmask",
-            )
-
-            mock_response_stream = convert_model_response_to_streaming(
-                assembled_model_response
-            )
-            yield mock_response_stream
+                pii_tokens=pii_tokens,
+            ):
+                yield out_chunk
 
         except Exception as e:
             verbose_proxy_logger.error(f"Error in PII streaming processing: {str(e)}")
-            for chunk in remaining_chunks:
+            for chunk in all_chunks:
                 yield chunk
+
+    # ------------------------------------------------------------------
+    # Incremental flushing helpers (LIT-3222)
+    # ------------------------------------------------------------------
+    # Trailing-character holdback per stream-choice. Must comfortably cover
+    # the longest realistic PII entity (email, phone, credit card, address).
+    _STREAM_PII_HOLDBACK_CHARS: int = 80
+
+    @staticmethod
+    def _extract_text_from_stream_chunk(
+        chunk: ModelResponseStream,
+    ) -> Optional[Tuple[int, str]]:
+        """Return (choice_index, text) for a chunk that carries text content.
+
+        Returns None for role-only / finish_reason-only / tool_call chunks.
+        Multi-choice (n>1) streams keep separate buffers per choice index.
+        """
+        choices = getattr(chunk, "choices", None)
+        if not choices:
+            return None
+        choice = choices[0]
+        delta = getattr(choice, "delta", None)
+        if delta is None:
+            return None
+        content = getattr(delta, "content", None)
+        if not isinstance(content, str) or not content:
+            return None
+        try:
+            idx = int(getattr(choice, "index", 0) or 0)
+        except (TypeError, ValueError):
+            idx = 0
+        return idx, content
+
+    @staticmethod
+    def _build_text_chunk(
+        template: ModelResponseStream,
+        text: str,
+        finish_reason: Optional[str] = None,
+    ) -> ModelResponseStream:
+        """Build a ModelResponseStream mirroring `template` but carrying `text`."""
+        choices = getattr(template, "choices", None) or []
+        if not choices:
+            return template
+        src_choice = choices[0]
+        src_delta = getattr(src_choice, "delta", None)
+        delta_kwargs: Dict[str, Any] = {"content": text}
+        if src_delta is not None:
+            role = getattr(src_delta, "role", None)
+            if role is not None:
+                delta_kwargs["role"] = role
+        try:
+            choice_index = int(getattr(src_choice, "index", 0) or 0)
+        except (TypeError, ValueError):
+            choice_index = 0
+        return ModelResponseStream(
+            id=getattr(template, "id", None),
+            created=getattr(template, "created", None),
+            model=getattr(template, "model", None),
+            object=getattr(template, "object", "chat.completion.chunk"),
+            system_fingerprint=getattr(template, "system_fingerprint", None),
+            choices=[
+                StreamingChoices(
+                    index=choice_index,
+                    delta=Delta(**delta_kwargs),
+                    finish_reason=finish_reason,
+                )
+            ],
+        )
+
+    def _split_at_safe_boundary(
+        self, text: str, holdback: int
+    ) -> Tuple[str, str]:
+        """Split text so as much as possible is safe to flush now.
+
+        Keep at least `holdback` chars in the tail. Within a small search
+        window, prefer to cut at a whitespace/punctuation boundary so PII
+        entities (emails, phones) are not split mid-token.
+        """
+        if len(text) <= holdback:
+            return "", text
+        cut = len(text) - holdback
+        safe_window = max(1, holdback // 2)
+        boundary_chars = " \n\t.,;:!?\"\')(\u2014\u2013-"
+        best = -1
+        for k in range(cut - 1, max(0, cut - safe_window) - 1, -1):
+            if text[k] in boundary_chars:
+                best = k + 1
+                break
+        if best > 0:
+            return text[:best], text[best:]
+        return text[:cut], text[cut:]
+
+    async def _mask_buffer_text(self, text: str, request_data: dict) -> str:
+        """Apply the configured Presidio analyzer/anonymizer to a text buffer."""
+        if not text:
+            return text
+        presidio_config = self.get_presidio_settings_from_request_data(
+            request_data or {}
+        )
+        return await self.check_pii(
+            text=text,
+            output_parse_pii=False,
+            presidio_config=presidio_config,
+            request_data=request_data,
+        )
+
+    async def _incremental_flush_chunk(
+        self,
+        chunk: ModelResponseStream,
+        request_data: dict,
+        text_buffers: Dict[int, str],
+        text_chunk_templates: Dict[int, ModelResponseStream],
+    ) -> AsyncGenerator[ModelResponseStream, None]:
+        """Apply Presidio masking to a single upstream chunk; yield masked
+        text chunks; holdback is per-choice-index.
+        """
+        text_info = self._extract_text_from_stream_chunk(chunk)
+        if text_info is None:
+            choice_idx = 0
+            choices = getattr(chunk, "choices", None) or []
+            if choices:
+                try:
+                    choice_idx = int(getattr(choices[0], "index", 0) or 0)
+                except (TypeError, ValueError):
+                    choice_idx = 0
+            buffered = text_buffers.get(choice_idx, "")
+            if buffered:
+                masked = await self._mask_buffer_text(buffered, request_data)
+                template = text_chunk_templates.get(choice_idx)
+                if template is not None and masked:
+                    yield self._build_text_chunk(template, masked)
+                text_buffers[choice_idx] = ""
+            yield chunk
+            return
+
+        idx, text = text_info
+        text_chunk_templates[idx] = chunk
+        text_buffers[idx] = text_buffers.get(idx, "") + text
+
+        head, tail = self._split_at_safe_boundary(
+            text_buffers[idx], self._STREAM_PII_HOLDBACK_CHARS
+        )
+        text_buffers[idx] = tail
+        if not head:
+            return
+
+        masked = await self._mask_buffer_text(head, request_data)
+        if not masked:
+            return
+        yield self._build_text_chunk(chunk, masked)
+
+    async def _incremental_unmask_chunk(
+        self,
+        chunk: ModelResponseStream,
+        pii_tokens: Dict[str, str],
+        text_buffers: Dict[int, str],
+        text_chunk_templates: Dict[int, ModelResponseStream],
+    ) -> AsyncGenerator[ModelResponseStream, None]:
+        """Apply pii_tokens substitution incrementally on a single chunk."""
+        text_info = self._extract_text_from_stream_chunk(chunk)
+        if text_info is None:
+            choice_idx = 0
+            choices = getattr(chunk, "choices", None) or []
+            if choices:
+                try:
+                    choice_idx = int(getattr(choices[0], "index", 0) or 0)
+                except (TypeError, ValueError):
+                    choice_idx = 0
+            buffered = text_buffers.get(choice_idx, "")
+            if buffered:
+                unmasked = self._unmask_pii_text(buffered, pii_tokens)
+                template = text_chunk_templates.get(choice_idx)
+                if template is not None and unmasked:
+                    yield self._build_text_chunk(template, unmasked)
+                text_buffers[choice_idx] = ""
+            yield chunk
+            return
+
+        idx, text = text_info
+        text_chunk_templates[idx] = chunk
+        text_buffers[idx] = text_buffers.get(idx, "") + text
+
+        head, tail = self._split_at_safe_boundary(
+            text_buffers[idx], self._STREAM_PII_HOLDBACK_CHARS
+        )
+        text_buffers[idx] = tail
+        if not head:
+            return
+        unmasked = self._unmask_pii_text(head, pii_tokens)
+        if not unmasked:
+            return
+        yield self._build_text_chunk(chunk, unmasked)
+
+    async def _incremental_flush_drain(
+        self,
+        request_data: dict,
+        text_buffers: Dict[int, str],
+        text_chunk_templates: Dict[int, ModelResponseStream],
+        mode: Literal["mask", "unmask"] = "mask",
+        pii_tokens: Optional[Dict[str, str]] = None,
+    ) -> AsyncGenerator[ModelResponseStream, None]:
+        """Drain remaining buffered text at end-of-stream (mask or unmask)."""
+        for idx, buffered in list(text_buffers.items()):
+            if not buffered:
+                continue
+            template = text_chunk_templates.get(idx)
+            if template is None:
+                continue
+            if mode == "mask":
+                processed = await self._mask_buffer_text(buffered, request_data)
+            else:
+                processed = self._unmask_pii_text(buffered, pii_tokens or {})
+            text_buffers[idx] = ""
+            if processed:
+                yield self._build_text_chunk(template, processed)
 
     async def async_post_call_streaming_iterator_hook(  # type: ignore[override]
         self,
