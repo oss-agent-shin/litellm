@@ -17,6 +17,25 @@ export function formatLocalDate(date: Date): string {
   return `${year}-${month}-${day}`;
 }
 
+/**
+ * X-axis label used in place of a calendar date when the picker range is
+ * a single calendar day. The Daily Spend chart only has day-resolution data,
+ * so a time-of-day style label is the cleanest signal to the user that
+ * they are looking at one day rather than the (otherwise identical) date.
+ */
+export const SINGLE_DAY_TIME_LABEL = "12 AM";
+
+/**
+ * True if both `from` and `to` are set and fall on the same local calendar
+ * day. Tolerant of nullish inputs.
+ */
+export function isSingleDayRange(
+  dateValue: DateRangePickerValue | undefined | null,
+): boolean {
+  if (!dateValue || !dateValue.from || !dateValue.to) return false;
+  return formatLocalDate(dateValue.from) === formatLocalDate(dateValue.to);
+}
+
 const SPEND_METRIC_KEYS: (keyof SpendMetrics)[] = [
   "spend",
   "prompt_tokens",
@@ -73,15 +92,40 @@ const BREAKDOWN_OBJECT_KEYS: BreakdownObjectKey[] = [
   "endpoints",
 ];
 
-function mergeMetricWithMetadata<T extends { metrics: SpendMetrics; metadata?: object }>(
-  a: T,
-  b: T,
-): T {
+function mergeApiKeyBreakdown(
+  a: { [key: string]: any } | undefined,
+  b: { [key: string]: any } | undefined,
+): { [key: string]: any } {
+  const out: { [key: string]: any } = { ...(a || {}) };
+  if (!b) return out;
+  for (const [id, value] of Object.entries(b)) {
+    if (out[id]) {
+      out[id] = {
+        ...out[id],
+        ...value,
+        metrics: addMetrics(out[id].metrics, value.metrics),
+        metadata: { ...(out[id].metadata || {}), ...(value.metadata || {}) },
+      };
+    } else {
+      out[id] = value;
+    }
+  }
+  return out;
+}
+
+function mergeMetricWithMetadata<
+  T extends {
+    metrics: SpendMetrics;
+    metadata?: object;
+    api_key_breakdown?: { [key: string]: any };
+  },
+>(a: T, b: T): T {
   return {
     ...a,
     ...b,
     metrics: addMetrics(a.metrics, b.metrics),
     metadata: { ...(a.metadata || {}), ...(b.metadata || {}) },
+    api_key_breakdown: mergeApiKeyBreakdown(a.api_key_breakdown, b.api_key_breakdown),
   };
 }
 
@@ -97,18 +141,23 @@ function mergeBreakdown(
       const target = merged[k] as { [key: string]: any };
       for (const [id, value] of Object.entries(fromSrc)) {
         if (target[id]) {
-          target[id] = mergeMetricWithMetadata(target[id], value);
+          target[id] = mergeMetricWithMetadata(target[id] as any, value as any);
         } else {
           target[id] = value;
         }
       }
     }
-    // api_keys has a different value type (KeyMetricWithMetadata) but the
-    // merge shape is the same — sum metrics, prefer the latter metadata.
+    // api_keys uses KeyMetricWithMetadata — no nested api_key_breakdown.
     const fromSrcKeys = src.api_keys || {};
     for (const [id, value] of Object.entries(fromSrcKeys)) {
-      if (merged.api_keys[id]) {
-        merged.api_keys[id] = mergeMetricWithMetadata(merged.api_keys[id], value);
+      const existing = merged.api_keys[id];
+      if (existing) {
+        merged.api_keys[id] = {
+          ...existing,
+          ...value,
+          metrics: addMetrics(existing.metrics, value.metrics),
+          metadata: { ...existing.metadata, ...value.metadata },
+        };
       } else {
         merged.api_keys[id] = value;
       }
@@ -118,10 +167,23 @@ function mergeBreakdown(
 }
 
 /**
- * Inclusive YYYY-MM-DD comparison.
- *
- * Both inputs are calendar date strings — no timezones involved.
+ * Collapse a list of `DailyData` rows into a single row labelled with the
+ * supplied `label`, summing every `SpendMetrics` numeric field and merging
+ * every `breakdown` sub-object across the rows. Used for the single-day
+ * case where the chart should render one bar regardless of how many
+ * paginated or timezone-ghost rows the API returned.
  */
+export function collapseDailyResults(rows: DailyData[], label: string): DailyData {
+  let metrics = zeroMetrics();
+  let breakdown = emptyBreakdown();
+  for (const r of rows) {
+    if (!r) continue;
+    if (r.metrics) metrics = addMetrics(metrics, r.metrics);
+    if (r.breakdown) breakdown = mergeBreakdown(breakdown, r.breakdown);
+  }
+  return { date: label, metrics, breakdown };
+}
+
 function dateInRange(date: string, fromYmd: string | null, toYmd: string | null): boolean {
   if (fromYmd && date < fromYmd) return false;
   if (toYmd && date > toYmd) return false;
@@ -129,44 +191,45 @@ function dateInRange(date: string, fromYmd: string | null, toYmd: string | null)
 }
 
 /**
- * Collapse the paginated daily activity `results` into one entry per calendar
- * date, summing metrics and merging breakdowns, then clamp to the picker
- * range and sort ascending.
+ * Shape the paginated daily activity `results` for the Daily Spend bar
+ * chart so it matches the user's selected `dateValue`:
  *
- * Fixes LIT-3383: when the Usage time range is "Today" (or any single-day
- * range), `usePaginatedDailyActivity` concatenates per-page results without
- * collapsing duplicate dates, so the Daily Spend bar chart renders one bar
- * per page — each labelled with the same date. Additionally, the backend
- * timezone padding in `_adjust_dates_for_timezone` can return rows for the
- * day *after* the picker range (e.g. tomorrow UTC for a PST user), giving
- * a phantom second bar. Clamping by the picker range strips those.
+ * - **Single-day range** (the "Today" preset, or any custom same-day pick):
+ *   collapse every row into a single bar labelled `SINGLE_DAY_TIME_LABEL`.
+ *   This dedupes the paginated rows (one bar per page is the LIT-3383
+ *   symptom) and silently absorbs the backend timezone ghost-row for
+ *   tomorrow UTC. Spend = sum across all returned rows.
+ *
+ * - **Multi-day range** (or no range): clamp rows to `[from, to]` using
+ *   local-time YYYY-MM-DD comparison (same calendar the daily activity
+ *   API calls use when populating `start_date`/`end_date`), then sort
+ *   ascending without mutating the input.
+ *
+ * Fixes LIT-3383 ("Daily Spend chart uses date labels for Today").
  */
 export function getDailySpendChartData(
   results: DailyData[],
   dateValue?: DateRangePickerValue,
 ): DailyData[] {
+  if (!results) return [];
+
+  if (isSingleDayRange(dateValue)) {
+    if (results.length === 0) return [];
+    return [collapseDailyResults(results, SINGLE_DAY_TIME_LABEL)];
+  }
+
   const fromYmd = dateValue?.from ? formatLocalDate(dateValue.from) : null;
   const toYmd = dateValue?.to ? formatLocalDate(dateValue.to) : null;
 
-  const byDate = new Map<string, DailyData>();
+  const filtered: DailyData[] = [];
   for (const row of results) {
     if (!row || !row.date) continue;
     if (!dateInRange(row.date, fromYmd, toYmd)) continue;
-
-    const existing = byDate.get(row.date);
-    if (!existing) {
-      byDate.set(row.date, {
-        date: row.date,
-        metrics: addMetrics(zeroMetrics(), row.metrics),
-        breakdown: mergeBreakdown(emptyBreakdown(), row.breakdown),
-      });
-    } else {
-      existing.metrics = addMetrics(existing.metrics, row.metrics);
-      existing.breakdown = mergeBreakdown(existing.breakdown, row.breakdown);
-    }
+    filtered.push(row);
   }
 
-  return Array.from(byDate.values()).sort(
-    (a, b) => new Date(a.date).getTime() - new Date(b.date).getTime(),
-  );
+  // Sort a copy so we never mutate the caller's array.
+  return filtered
+    .slice()
+    .sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
 }
