@@ -218,14 +218,49 @@ describe("provider_info_helpers", () => {
       expect(result).toEqual(["gpt-3.5-turbo", "gpt-4"]);
     });
 
-    it("should return models when litellm_provider includes the provider string", () => {
+    it("should not leak models whose litellm_provider merely contains the provider string (LIT-3311)", () => {
+      // Regression: previously getProviderModels used litellmProvider.includes(custom_llm_provider),
+      // so e.g. "vertex_ai-anthropic_models" was returned for Provider=Anthropic. We now
+      // require an exact match by default.
       const modelMap = {
+        "claude-3-opus": { litellm_provider: "anthropic" },
+        "vertex_ai/claude-3-5-sonnet": { litellm_provider: "vertex_ai-anthropic_models" },
         "custom-openai-model": { litellm_provider: "custom_openai_endpoint" },
         "another-model": { litellm_provider: "openai" },
       };
-      const result = getProviderModels(Providers.OpenAI, modelMap);
-      expect(result).toContain("custom-openai-model");
-      expect(result).toContain("another-model");
+      const anthropic = getProviderModels(Providers.Anthropic, modelMap);
+      expect(anthropic).toEqual(["claude-3-opus"]);
+      expect(anthropic).not.toContain("vertex_ai/claude-3-5-sonnet");
+
+      const openai = getProviderModels(Providers.OpenAI, modelMap);
+      expect(openai).toEqual(["another-model"]);
+      expect(openai).not.toContain("custom-openai-model");
+    });
+
+    it("should include vertex_ai-* namespaced models under the Vertex AI provider (LIT-3311)", () => {
+      const modelMap = {
+        "vertex_ai/gemini-2.0-pro": { litellm_provider: "vertex_ai" },
+        "vertex_ai/claude-3-5-sonnet": { litellm_provider: "vertex_ai-anthropic_models" },
+        "vertex_ai/mistral-large": { litellm_provider: "vertex_ai-mistral_models" },
+        "claude-3-opus": { litellm_provider: "anthropic" },
+      };
+      const result = getProviderModels(Providers.Vertex_AI, modelMap);
+      expect(result).toContain("vertex_ai/gemini-2.0-pro");
+      expect(result).toContain("vertex_ai/claude-3-5-sonnet");
+      expect(result).toContain("vertex_ai/mistral-large");
+      expect(result).not.toContain("claude-3-opus");
+    });
+
+    it("should include bedrock_converse models under the Bedrock provider", () => {
+      const modelMap = {
+        "anthropic.claude-3-5-sonnet-20240620-v1:0": { litellm_provider: "bedrock" },
+        "us.anthropic.claude-sonnet-4-5-v1:0": { litellm_provider: "bedrock_converse" },
+        "claude-3-opus": { litellm_provider: "anthropic" },
+      };
+      const result = getProviderModels(Providers.Bedrock, modelMap);
+      expect(result).toContain("anthropic.claude-3-5-sonnet-20240620-v1:0");
+      expect(result).toContain("us.anthropic.claude-sonnet-4-5-v1:0");
+      expect(result).not.toContain("claude-3-opus");
     });
 
     it("should filter out models with null values", () => {
