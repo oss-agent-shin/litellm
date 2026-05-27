@@ -4237,7 +4237,7 @@ async def _authorize_and_filter_teams(
     prisma_client: Any,
     user_api_key_cache: Any,
     proxy_logging_obj: Any,
-) -> list:
+) -> Tuple[list, bool]:
     """
     Authorize the /team/list request and return filtered teams.
 
@@ -4245,9 +4245,17 @@ async def _authorize_and_filter_teams(
     - Org admins: teams from their orgs (scoped to user_id if provided).
     - Own query (user_id matches caller): teams the user is a member of.
     - Others: 401.
+
+    Returns:
+        (teams, narrow_response) where ``narrow_response`` is True when the
+        caller is a non-admin, non-org-admin internal user querying their own
+        teams. Callers MUST then strip other members' data (keys, memberships,
+        members_with_roles) from each team before returning, to enforce
+        least-privilege on the ``/team/list`` response (LIT-2553).
     """
     is_proxy_admin = _user_has_admin_view(user_api_key_dict)
     allowed_org_ids: Optional[List[str]] = None
+    is_internal_user_own_query = False
 
     if not is_proxy_admin:
         is_own_query = (
@@ -4285,6 +4293,12 @@ async def _authorize_and_filter_teams(
                 },
             )
 
+    # Non-admin own-query (caller passed user_id == their own user_id, and
+    # they aren't an org admin) — flag so list_team narrows the response to
+    # only the caller's own keys / membership rows (LIT-2553).
+    if not is_proxy_admin and allowed_org_ids is None:
+        is_internal_user_own_query = True
+
     if allowed_org_ids is not None:
         # Org admin: query DB for teams in their orgs
         org_teams = await prisma_client.db.litellm_teamtable.find_many(
@@ -4292,32 +4306,91 @@ async def _authorize_and_filter_teams(
             include={"litellm_model_table": True},
         )
         if not user_id:
-            return list(org_teams)
+            return list(org_teams), is_internal_user_own_query
         # Filter org teams to only those where the target user is a member
-        return [
-            team
-            for team in org_teams
-            if team.members_with_roles
-            and any(m.get("user_id") == user_id for m in team.members_with_roles)
-        ]
+        return (
+            [
+                team
+                for team in org_teams
+                if team.members_with_roles
+                and any(
+                    m.get("user_id") == user_id for m in team.members_with_roles
+                )
+            ],
+            is_internal_user_own_query,
+        )
     elif user_id:
         # Regular user: fetch all and filter by membership (Prisma can't filter JSON arrays)
         response = await prisma_client.db.litellm_teamtable.find_many(
             include={"litellm_model_table": True}
         )
-        return [
-            team
-            for team in response
-            if team.members_with_roles
-            and any(m.get("user_id") == user_id for m in team.members_with_roles)
-        ]
+        return (
+            [
+                team
+                for team in response
+                if team.members_with_roles
+                and any(
+                    m.get("user_id") == user_id for m in team.members_with_roles
+                )
+            ],
+            is_internal_user_own_query,
+        )
     else:
         # Proxy admin: all teams
-        return list(
-            await prisma_client.db.litellm_teamtable.find_many(
-                include={"litellm_model_table": True}
-            )
+        return (
+            list(
+                await prisma_client.db.litellm_teamtable.find_many(
+                    include={"litellm_model_table": True}
+                )
+            ),
+            is_internal_user_own_query,
         )
+
+
+
+
+def _narrow_team_response_for_internal_user(
+    team_response: TeamListResponseObject,
+    caller_user_id: str,
+) -> TeamListResponseObject:
+    """
+    Narrow a /team/list team response for a non-admin internal_user own-query.
+
+    The caller already has access (their own user_id was matched in
+    ``_authorize_and_filter_teams``), but the default response leaks data that
+    belongs to *other* members of the same teams. This helper restricts the
+    response to data scoped to the caller, in line with least-privilege:
+
+    - ``keys`` -- only keys whose ``user_id`` matches the caller.
+    - ``team_memberships`` -- only the caller's own membership row.
+    - ``members_with_roles`` -- only the caller's own member entry.
+
+    Team-level fields (``team_alias``, ``models``, ``max_budget``,
+    ``organization_id``, etc.) are left intact because the dashboard UI relies
+    on them when rendering "your teams" for an internal user.
+
+    See LIT-2553 / the report on ``/team/list?user_id=<self>``.
+    """
+    team_response.keys = [
+        k
+        for k in (team_response.keys or [])
+        if getattr(k, "user_id", None) == caller_user_id
+    ]
+
+    team_response.team_memberships = [
+        tm
+        for tm in (team_response.team_memberships or [])
+        if tm.user_id == caller_user_id
+    ]
+
+    if team_response.members_with_roles:
+        team_response.members_with_roles = [
+            m
+            for m in team_response.members_with_roles
+            if m.user_id == caller_user_id
+        ]
+
+    return team_response
 
 
 @router.get(
@@ -4354,12 +4427,14 @@ async def list_team(
             detail={"error": CommonProxyErrors.db_not_connected_error.value},
         )
 
-    filtered_response = await _authorize_and_filter_teams(
-        user_api_key_dict=user_api_key_dict,
-        user_id=user_id,
-        prisma_client=prisma_client,
-        user_api_key_cache=user_api_key_cache,
-        proxy_logging_obj=proxy_logging_obj,
+    filtered_response, narrow_response_for_internal_user = (
+        await _authorize_and_filter_teams(
+            user_api_key_dict=user_api_key_dict,
+            user_id=user_id,
+            prisma_client=prisma_client,
+            user_api_key_cache=user_api_key_cache,
+            proxy_logging_obj=proxy_logging_obj,
+        )
     )
 
     _team_ids = [team.team_id for team in filtered_response]
@@ -4393,6 +4468,16 @@ async def list_team(
             """.format(team.team_id, team.model_dump(), str(e))
             verbose_proxy_logger.exception(team_exception)
             continue
+    # LIT-2553: For non-admin internal users querying their own teams, narrow
+    # every team response to only the caller's own keys / memberships /
+    # member entry before sorting and returning.
+    if narrow_response_for_internal_user and user_api_key_dict.user_id is not None:
+        caller_user_id = user_api_key_dict.user_id
+        returned_responses = [
+            _narrow_team_response_for_internal_user(team, caller_user_id)
+            for team in returned_responses
+        ]
+
     # Sort the responses by team_alias
     returned_responses.sort(key=lambda x: (getattr(x, "team_alias", "") or ""))
 
