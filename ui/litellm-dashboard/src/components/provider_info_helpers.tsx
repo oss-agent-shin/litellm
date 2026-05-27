@@ -387,10 +387,11 @@ export const getProviderModels = (provider: Providers, modelMap: any): Array<str
     Object.entries(modelMap).forEach(([key, value]) => {
       if (value !== null && typeof value === "object" && "litellm_provider" in (value as object)) {
         const litellmProvider = (value as any)["litellm_provider"];
-        if (
-          litellmProvider === custom_llm_provider ||
-          (typeof litellmProvider === "string" && litellmProvider.includes(custom_llm_provider))
-        ) {
+        // Exact match only. A substring match (e.g. .includes()) caused namespaced
+        // litellm_provider values like "vertex_ai-anthropic_models" to leak into
+        // unrelated dropdowns (e.g. Anthropic). Namespaced provider variants are
+        // re-added under their owning provider via the explicit blocks below.
+        if (litellmProvider === custom_llm_provider) {
           providerModels.push(key);
         }
       }
@@ -423,6 +424,41 @@ export const getProviderModels = (provider: Providers, modelMap: any): Array<str
           (value as any)["litellm_provider"] === "sagemaker_chat"
         ) {
           providerModels.push(key);
+        }
+      });
+    }
+
+    // Special case for Bedrock
+    // bedrock_converse models are bedrock models exposed via the Converse API.
+    if (providerKey == Providers.Bedrock) {
+      console.log("Adding bedrock_converse models");
+      Object.entries(modelMap).forEach(([key, value]) => {
+        if (
+          value !== null &&
+          typeof value === "object" &&
+          "litellm_provider" in (value as object) &&
+          (value as any)["litellm_provider"] === "bedrock_converse"
+        ) {
+          providerModels.push(key);
+        }
+      });
+    }
+
+    // Special case for Vertex AI
+    // Namespaced provider keys like vertex_ai-anthropic_models, vertex_ai-mistral_models,
+    // etc. are all Vertex AI models hosted under different model families.
+    if (providerKey == Providers.Vertex_AI) {
+      console.log("Adding vertex_ai-* namespaced models");
+      Object.entries(modelMap).forEach(([key, value]) => {
+        if (
+          value !== null &&
+          typeof value === "object" &&
+          "litellm_provider" in (value as object)
+        ) {
+          const lp = (value as any)["litellm_provider"];
+          if (typeof lp === "string" && lp.startsWith("vertex_ai-")) {
+            providerModels.push(key);
+          }
         }
       });
     }
