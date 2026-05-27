@@ -1,39 +1,35 @@
+import { DateRangePickerValue } from "@tremor/react";
+
+import { BreakdownMetrics, DailyData, SpendMetrics } from "../types";
+
 /**
- * Helpers for the "Daily Spend" bar chart on the Usage page.
+ * Format a Date as a local-time YYYY-MM-DD string.
  *
- * Bug: when the user picks a single-day range like "Today", the underlying
- * `/user/daily/activity` endpoint returns one row per UTC calendar day that
- * overlaps the requested range. Because the UI sends the range using the
- * browser's local timezone (start-of-day -> end-of-day local) and the server
- * groups by UTC day, that range can span 1-2 UTC days and produce 1-2 bars
- * whose X-axis ticks are calendar dates ("2025-05-26", "2026-05-27") even
- * though the user only selected a single day.
- *
- * Fix: when the selected date range is a single local calendar day, collapse
- * those rows into a single bar and replace the X-axis label with a time-of-day
- * string ("12 AM") -- Tremor's BarChart has no `xAxisFormatter` prop, so we
- * mutate the `index` value itself. All other ranges are returned unchanged
- * (sorted ascending by date).
+ * Mirrors `formatDate` in `networking.tsx` so that comparisons between the
+ * picker range and the API-returned `date` strings use the same calendar.
+ * Using local-time components matches what the daily activity calls send to
+ * the backend in `start_date`/`end_date`.
  */
-
-import type { DateRangePickerValue } from "@tremor/react";
-
-import type { BreakdownMetrics, DailyData, SpendMetrics } from "../types";
-
-export function isSingleDayRange(value: DateRangePickerValue | undefined | null): boolean {
-  if (!value || !value.from || !value.to) return false;
-  const from = new Date(value.from);
-  const to = new Date(value.to);
-  return (
-    from.getFullYear() === to.getFullYear() &&
-    from.getMonth() === to.getMonth() &&
-    from.getDate() === to.getDate()
-  );
+export function formatLocalDate(date: Date): string {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
 }
 
-export const SINGLE_DAY_TIME_LABEL = "12 AM";
+const SPEND_METRIC_KEYS: (keyof SpendMetrics)[] = [
+  "spend",
+  "prompt_tokens",
+  "completion_tokens",
+  "total_tokens",
+  "api_requests",
+  "successful_requests",
+  "failed_requests",
+  "cache_read_input_tokens",
+  "cache_creation_input_tokens",
+];
 
-function emptyMetrics(): SpendMetrics {
+function zeroMetrics(): SpendMetrics {
   return {
     spend: 0,
     prompt_tokens: 0,
@@ -47,6 +43,14 @@ function emptyMetrics(): SpendMetrics {
   };
 }
 
+function addMetrics(a: SpendMetrics, b: SpendMetrics): SpendMetrics {
+  const out = { ...a };
+  for (const key of SPEND_METRIC_KEYS) {
+    out[key] = (a[key] || 0) + (b[key] || 0);
+  }
+  return out;
+}
+
 function emptyBreakdown(): BreakdownMetrics {
   return {
     models: {},
@@ -55,40 +59,114 @@ function emptyBreakdown(): BreakdownMetrics {
     providers: {},
     api_keys: {},
     entities: {},
+    endpoints: {},
   };
 }
 
-function addMetrics(into: SpendMetrics, from: SpendMetrics): void {
-  into.spend += from.spend || 0;
-  into.prompt_tokens += from.prompt_tokens || 0;
-  into.completion_tokens += from.completion_tokens || 0;
-  into.total_tokens += from.total_tokens || 0;
-  into.api_requests += from.api_requests || 0;
-  into.successful_requests += from.successful_requests || 0;
-  into.failed_requests += from.failed_requests || 0;
-  into.cache_read_input_tokens += from.cache_read_input_tokens || 0;
-  into.cache_creation_input_tokens += from.cache_creation_input_tokens || 0;
-}
+type BreakdownObjectKey = Exclude<keyof BreakdownMetrics, "api_keys">;
+const BREAKDOWN_OBJECT_KEYS: BreakdownObjectKey[] = [
+  "models",
+  "model_groups",
+  "mcp_servers",
+  "providers",
+  "entities",
+  "endpoints",
+];
 
-export function collapseDailyResults(results: DailyData[], label: string): DailyData {
-  const metrics = emptyMetrics();
-  for (const row of results) {
-    if (row && row.metrics) addMetrics(metrics, row.metrics);
-  }
+function mergeMetricWithMetadata<T extends { metrics: SpendMetrics; metadata?: object }>(
+  a: T,
+  b: T,
+): T {
   return {
-    date: label,
-    metrics,
-    breakdown: emptyBreakdown(),
+    ...a,
+    ...b,
+    metrics: addMetrics(a.metrics, b.metrics),
+    metadata: { ...(a.metadata || {}), ...(b.metadata || {}) },
   };
 }
 
+function mergeBreakdown(
+  a: BreakdownMetrics | undefined,
+  b: BreakdownMetrics | undefined,
+): BreakdownMetrics {
+  const merged = emptyBreakdown();
+  for (const src of [a, b]) {
+    if (!src) continue;
+    for (const k of BREAKDOWN_OBJECT_KEYS) {
+      const fromSrc = src[k] || {};
+      const target = merged[k] as { [key: string]: any };
+      for (const [id, value] of Object.entries(fromSrc)) {
+        if (target[id]) {
+          target[id] = mergeMetricWithMetadata(target[id], value);
+        } else {
+          target[id] = value;
+        }
+      }
+    }
+    // api_keys has a different value type (KeyMetricWithMetadata) but the
+    // merge shape is the same — sum metrics, prefer the latter metadata.
+    const fromSrcKeys = src.api_keys || {};
+    for (const [id, value] of Object.entries(fromSrcKeys)) {
+      if (merged.api_keys[id]) {
+        merged.api_keys[id] = mergeMetricWithMetadata(merged.api_keys[id], value);
+      } else {
+        merged.api_keys[id] = value;
+      }
+    }
+  }
+  return merged;
+}
+
+/**
+ * Inclusive YYYY-MM-DD comparison.
+ *
+ * Both inputs are calendar date strings — no timezones involved.
+ */
+function dateInRange(date: string, fromYmd: string | null, toYmd: string | null): boolean {
+  if (fromYmd && date < fromYmd) return false;
+  if (toYmd && date > toYmd) return false;
+  return true;
+}
+
+/**
+ * Collapse the paginated daily activity `results` into one entry per calendar
+ * date, summing metrics and merging breakdowns, then clamp to the picker
+ * range and sort ascending.
+ *
+ * Fixes LIT-3383: when the Usage time range is "Today" (or any single-day
+ * range), `usePaginatedDailyActivity` concatenates per-page results without
+ * collapsing duplicate dates, so the Daily Spend bar chart renders one bar
+ * per page — each labelled with the same date. Additionally, the backend
+ * timezone padding in `_adjust_dates_for_timezone` can return rows for the
+ * day *after* the picker range (e.g. tomorrow UTC for a PST user), giving
+ * a phantom second bar. Clamping by the picker range strips those.
+ */
 export function getDailySpendChartData(
   results: DailyData[],
-  dateValue: DateRangePickerValue | undefined | null,
+  dateValue?: DateRangePickerValue,
 ): DailyData[] {
-  if (!results || results.length === 0) return [];
-  if (isSingleDayRange(dateValue)) {
-    return [collapseDailyResults(results, SINGLE_DAY_TIME_LABEL)];
+  const fromYmd = dateValue?.from ? formatLocalDate(dateValue.from) : null;
+  const toYmd = dateValue?.to ? formatLocalDate(dateValue.to) : null;
+
+  const byDate = new Map<string, DailyData>();
+  for (const row of results) {
+    if (!row || !row.date) continue;
+    if (!dateInRange(row.date, fromYmd, toYmd)) continue;
+
+    const existing = byDate.get(row.date);
+    if (!existing) {
+      byDate.set(row.date, {
+        date: row.date,
+        metrics: addMetrics(zeroMetrics(), row.metrics),
+        breakdown: mergeBreakdown(emptyBreakdown(), row.breakdown),
+      });
+    } else {
+      existing.metrics = addMetrics(existing.metrics, row.metrics);
+      existing.breakdown = mergeBreakdown(existing.breakdown, row.breakdown);
+    }
   }
-  return [...results].sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
+
+  return Array.from(byDate.values()).sort(
+    (a, b) => new Date(a.date).getTime() - new Date(b.date).getTime(),
+  );
 }
