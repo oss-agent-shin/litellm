@@ -1,0 +1,6 @@
+{
+  "role_select_inner_text": [
+    "Internal User (View Only) - view their own keys, view their own spend"
+  ],
+  "modal_inner_text": "Create a User who can own keys\nEmail invitations\nNew users receive an email invite only when an email integration (SMTP, Resend, or SendGrid) is configured. Learn how to set up email notifications\nUser Email\nGlobal Proxy Role \nInternal User (View Only) - view their own keys, view their own spend\nTeam\nSearch or select a team\nIf selected, user will be added as a 'user' role to the team.\nOrganization\nSelect Organization\nThe user will be added to the selected organization(s).\nMetadata\nSend invitation email\nPersonal Key Creation\nInvite User"
+}
