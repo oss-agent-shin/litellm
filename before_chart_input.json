@@ -1,0 +1,39 @@
+{
+  "label": "BEFORE FIX (chart sees 3 rows -> 3 duplicate-date bars)",
+  "bars": 3,
+  "x_axis_labels": [
+    "2026-05-29",
+    "2026-05-29",
+    "2026-05-29"
+  ],
+  "totals": [
+    {
+      "date": "2026-05-29",
+      "spend": 12.4,
+      "api_requests": 86,
+      "total_tokens": 41200,
+      "models_in_tooltip": [
+        "gpt-4o"
+      ]
+    },
+    {
+      "date": "2026-05-29",
+      "spend": 4.95,
+      "api_requests": 31,
+      "total_tokens": 15600,
+      "models_in_tooltip": [
+        "claude-3-5-sonnet"
+      ]
+    },
+    {
+      "date": "2026-05-29",
+      "spend": 8.1,
+      "api_requests": 52,
+      "total_tokens": 27800,
+      "models_in_tooltip": [
+        "gpt-4o",
+        "claude-3-5-sonnet"
+      ]
+    }
+  ]
+}
